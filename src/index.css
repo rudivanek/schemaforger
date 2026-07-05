@@ -1,0 +1,169 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;1,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: #EDEBE6;
+    color: #1A1B1E;
+  }
+
+  :focus-visible {
+    outline: 2px solid #2B5C8A;
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .proof-card {
+    @apply bg-white border border-rule rounded;
+  }
+
+  .proof-code {
+    font-family: 'IBM Plex Mono', monospace;
+    background-color: #F4F2ED;
+    border: 1px solid #D6D3CC;
+    border-radius: 2px;
+    padding: 0.75rem;
+    color: #1A1B1E;
+  }
+
+  .proof-field {
+    @apply flex flex-col gap-0.5 bg-proof rounded p-2 border border-rule;
+  }
+
+  .proof-field > span:first-child {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .proof-field > span:last-child {
+    font-size: 0.75rem;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .input-field {
+    @apply border border-rule rounded bg-white text-ink text-sm px-3 py-1.5 transition-colors;
+    font-family: 'IBM Plex Sans', sans-serif;
+  }
+
+  .input-field:focus {
+    @apply outline-none border-blue;
+  }
+
+  .input-field::placeholder {
+    color: #9B9894;
+  }
+
+  select.input-field {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239B9894' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    padding-right: 2rem;
+  }
+
+  textarea.input-field {
+    resize: vertical;
+  }
+
+  .btn-primary {
+    @apply bg-ink text-white text-xs font-mono px-3 py-1.5 rounded border border-ink transition-colors;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    @apply bg-ink/85;
+  }
+
+  .btn-primary:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+
+  .btn-orange {
+    @apply bg-orange text-white text-xs font-mono px-3 py-1.5 rounded border border-orange transition-colors;
+  }
+
+  .btn-orange:hover:not(:disabled) {
+    background-color: #d44608;
+  }
+
+  .btn-orange:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+
+  .btn-ghost {
+    @apply text-xs font-mono text-ink-muted px-3 py-1.5 rounded border border-rule bg-transparent transition-colors;
+  }
+
+  .btn-ghost:hover {
+    @apply text-ink bg-proof;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-1.5 text-xs font-mono text-ink-muted px-3 py-1.5 rounded transition-colors;
+  }
+
+  .nav-link:hover {
+    @apply text-ink bg-proof;
+  }
+
+  .nav-link-active {
+    @apply text-ink bg-proof;
+  }
+
+  .chip {
+    @apply inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border;
+  }
+
+  .chip-ink {
+    background-color: rgba(26, 27, 30, 0.08);
+    @apply text-ink;
+    border-color: rgba(26, 27, 30, 0.2);
+  }
+
+  .chip-blue {
+    @apply border-blue/30 text-blue;
+    background-color: rgba(43, 92, 138, 0.07);
+  }
+
+  .chip-orange {
+    @apply border-orange/30 text-orange;
+    background-color: rgba(232, 80, 10, 0.07);
+  }
+
+  .chip-green {
+    @apply border-green/30 text-green;
+    background-color: rgba(42, 122, 75, 0.07);
+  }
+
+  .chip-red {
+    @apply border-red/30 text-red;
+    background-color: rgba(185, 28, 28, 0.07);
+  }
+
+  .section-title {
+    @apply text-xs font-mono uppercase tracking-wider text-ink-muted font-medium;
+  }
+
+  .field-label {
+    @apply block text-xs font-mono uppercase tracking-wider text-ink-muted mb-1;
+  }
+}
