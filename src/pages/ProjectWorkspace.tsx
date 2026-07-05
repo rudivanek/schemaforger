@@ -108,6 +108,38 @@ function collectTypesFromJsonLd(root: unknown): string[] {
   return Array.from(types);
 }
 
+function normalizeForHomepageCompare(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, '') + u.pathname.replace(/\/+$/, '');
+  } catch { return url.toLowerCase().trim(); }
+}
+
+function extractMainEntityFromJsonLd(
+  jsonld: unknown,
+  primaryType: string,
+): { id: string; type: string; name: string } | null {
+  const nodes: Record<string, unknown>[] = [];
+  const walk = (v: unknown) => {
+    if (Array.isArray(v)) { v.forEach(walk); return; }
+    if (v && typeof v === 'object') {
+      const obj = v as Record<string, unknown>;
+      if (obj['@type']) nodes.push(obj);
+      Object.values(obj).forEach(walk);
+    }
+  };
+  walk(jsonld);
+  const node = nodes.find(n => {
+    const types = ([] as string[]).concat(n['@type'] as string | string[]);
+    return types.includes(primaryType);
+  });
+  if (!node) return null;
+  const id = typeof node['@id'] === 'string' ? node['@id'] : null;
+  const name = typeof node['name'] === 'string' ? node['name'] : null;
+  if (!id || !name) return null;
+  return { id, type: primaryType, name };
+}
+
 export default function ProjectWorkspace() {
   const { id: clientId, projectId } = useParams<{ id: string; projectId: string }>();
   const navigate = useNavigate();
@@ -126,6 +158,10 @@ export default function ProjectWorkspace() {
   const [operatorNotes, setOperatorNotes] = useState('');
   const [duplicateProject, setDuplicateProject] = useState<SchemaProject | null>(null);
   const dupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Secondary-page entity reference
+  const [mainEntity, setMainEntity] = useState<{ id: string; type: string; name: string } | null>(null);
+  const [homepageProjectMissing, setHomepageProjectMissing] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [jsonld, setJsonld] = useState<Record<string, unknown> | null>(null);
   const [generateError, setGenerateError] = useState('');
@@ -210,6 +246,52 @@ export default function ProjectWorkspace() {
     return () => { if (dupTimerRef.current) clearTimeout(dupTimerRef.current); };
   }, [pageUrl, isNew]);
 
+  // Determine if this is a secondary page (not the client's homepage)
+  const isSecondaryPage = (() => {
+    if (!client || !pageUrl) return false;
+    try {
+      return normalizeForHomepageCompare(pageUrl) !== normalizeForHomepageCompare(client.website_url);
+    } catch { return false; }
+  })();
+
+  // When on a secondary page, look up the homepage project to extract the main entity reference
+  useEffect(() => {
+    if (!isSecondaryPage || !clientId || !client || !template) {
+      setMainEntity(null);
+      setHomepageProjectMissing(false);
+      return;
+    }
+    const normalizedHome = normalizeForHomepageCompare(client.website_url);
+    (async () => {
+      const { data: homepageProjects } = await supabase
+        .from('schema_projects')
+        .select('id, page_url, status, generated_jsonld')
+        .eq('client_id', clientId)
+        .in('status', ['validated', 'delivered']);
+
+      const homeProj = (homepageProjects ?? []).find(p =>
+        normalizeForHomepageCompare(p.page_url) === normalizedHome &&
+        p.id !== (project?.id ?? '')
+      );
+
+      if (!homeProj?.generated_jsonld) {
+        setMainEntity(null);
+        setHomepageProjectMissing(true);
+        return;
+      }
+
+      const primaryType = template.schema_type_combo[0];
+      const entity = extractMainEntityFromJsonLd(homeProj.generated_jsonld, primaryType);
+      if (entity) {
+        setMainEntity(entity);
+        setHomepageProjectMissing(false);
+      } else {
+        setMainEntity(null);
+        setHomepageProjectMissing(true);
+      }
+    })();
+  }, [isSecondaryPage, clientId, client?.website_url, template?.id, project?.id]);
+
   const persistProject = async (updates: Partial<SchemaProject>) => {
     if (isNew && !project) {
       const { data, error } = await supabase.from('schema_projects').insert({
@@ -261,7 +343,12 @@ export default function ProjectWorkspace() {
     setGenerating(true);
     try {
       const { data, error } = await supabase.functions.invoke('generate-schema', {
-        body: { scraped, template, extra_info: operatorNotes },
+        body: {
+          scraped,
+          template,
+          extra_info: operatorNotes,
+          ...(mainEntity ? { main_entity: mainEntity } : {}),
+        },
       });
       if (error) throw error;
       if (!data?.jsonld) throw new Error('No se recibió JSON-LD del servidor');
@@ -598,7 +685,7 @@ export default function ProjectWorkspace() {
                           </div>
                         )}
 
-                        {requiredTypes.length > 0 && (
+                        {requiredTypes.length > 0 && !isSecondaryPage && (
                           <div className="flex items-start gap-2 flex-wrap mb-1">
                             <span className="text-xs font-mono text-ink-muted shrink-0 pt-0.5">
                               Requerido para este vertical:
@@ -664,22 +751,44 @@ export default function ProjectWorkspace() {
       {step === 2 && (
         <div className="space-y-4">
           {template && (
-            <div className="proof-card p-4 flex items-center justify-between">
-              <div>
-                <span className="text-xs font-mono text-ink-muted">Tipo de schema: </span>
-                <span className="text-xs font-mono text-ink font-semibold">
-                  {template.schema_type_combo.join(' + ')}
-                </span>
-                <span className="ml-2 chip chip-blue">{template.label_es}</span>
+            <div className="proof-card p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="text-xs font-mono text-ink-muted">Tipo de schema: </span>
+                  <span className="text-xs font-mono text-ink font-semibold">
+                    {template.schema_type_combo.join(' + ')}
+                  </span>
+                  <span className="ml-2 chip chip-blue">{template.label_es}</span>
+                </div>
+                <button
+                  onClick={handleGenerate}
+                  disabled={generating}
+                  className="btn-orange flex items-center gap-2"
+                >
+                  <Sparkles size={14} />
+                  {generating ? 'Generando...' : 'Generar con IA'}
+                </button>
               </div>
-              <button
-                onClick={handleGenerate}
-                disabled={generating}
-                className="btn-orange flex items-center gap-2"
-              >
-                <Sparkles size={14} />
-                {generating ? 'Generando...' : 'Generar con IA'}
-              </button>
+
+              {isSecondaryPage && mainEntity && (
+                <div className="mt-3 flex items-start gap-2 bg-blue-50 border border-blue-200 rounded p-2.5">
+                  <Info size={13} className="text-blue-600 shrink-0 mt-0.5" />
+                  <p className="text-xs font-mono text-blue-700">
+                    Página secundaria — se referenciará la entidad principal de la página de inicio.{' '}
+                    <span className="text-blue-500 bg-blue-100 px-1 rounded">{mainEntity.id}</span>
+                    {' '}({mainEntity.type}: {mainEntity.name})
+                  </p>
+                </div>
+              )}
+
+              {isSecondaryPage && homepageProjectMissing && (
+                <div className="mt-3 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded p-2.5">
+                  <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
+                  <p className="text-xs font-mono text-amber-700">
+                    Genera primero el proyecto de la página de inicio (estado: validado o entregado) para referenciar la entidad principal. Puedes generar igualmente sin ella.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
