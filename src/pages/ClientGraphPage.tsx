@@ -376,7 +376,9 @@ export default function ClientGraphPage() {
     setLiveRunning(true);
     setLiveResults({});
 
-    const validProjs = allProjects.filter(p => p.page_url && p.generated_jsonld);
+    const validProjs = allProjects.filter(
+      p => p.page_url && p.generated_jsonld && (p.status === 'validated' || p.status === 'delivered'),
+    );
     const initLoading: Record<string, boolean> = {};
     validProjs.forEach(p => { initLoading[p.id] = true; });
     setLiveLoading(initLoading);
@@ -442,6 +444,7 @@ export default function ClientGraphPage() {
   const liveCheckCompleted = liveTimestamp !== null;
   const liveProjectCount = Object.keys(liveResults).length;
   const allMatch = liveCheckCompleted && liveProjectCount > 0 && Object.values(liveResults).every(r => r.overallStatus === 'match');
+  const draftCount = allProjects.filter(p => p.status === 'draft').length;
 
   if (loading) {
     return (
@@ -472,7 +475,10 @@ export default function ClientGraphPage() {
           <div>
             <h1 className="text-base font-semibold text-ink mb-0.5">Vista consolidada del cliente</h1>
             <p className="text-xs font-mono text-ink-muted">
-              {projects.length} página{projects.length !== 1 ? 's' : ''} validada{projects.length !== 1 ? 's' : ''}
+              Incluye proyectos validados y entregados.
+              {draftCount > 0 && ` ${draftCount} proyecto${draftCount !== 1 ? 's' : ''} en borrador excluido${draftCount !== 1 ? 's' : ''}.`}
+              {' · '}
+              {projects.length} página{projects.length !== 1 ? 's' : ''}
               {' · '}
               {allFlatNodes.length} nodo{allFlatNodes.length !== 1 ? 's' : ''} schema
             </p>
@@ -704,7 +710,7 @@ export default function ClientGraphPage() {
                 )}
 
                 {allProjects
-                  .filter(p => p.page_url && p.generated_jsonld)
+                  .filter(p => p.page_url && p.generated_jsonld && (p.status === 'validated' || p.status === 'delivered'))
                   .map(proj => {
                     const result = liveResults[proj.id];
                     const isLoading = !!liveLoading[proj.id];

@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import type { Client, SchemaProject } from '../lib/database.types';
-import { ArrowLeft, Plus, X, AlertTriangle, AlertCircle, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Plus, X, AlertTriangle, AlertCircle, ExternalLink, Trash2 } from 'lucide-react';
 
 const STATUS_CHIP: Record<string, string> = {
   draft: 'chip-orange',
@@ -33,6 +33,86 @@ function sameDomain(a: string, b: string): boolean {
   }
 }
 
+// ── Orphan-reference helpers ──────────────────────────────────────────────────
+
+function collectDefinedIds(jsonld: unknown): string[] {
+  const ids: string[] = [];
+  const walk = (v: unknown) => {
+    if (!v || typeof v !== 'object') return;
+    if (Array.isArray(v)) { v.forEach(walk); return; }
+    const obj = v as Record<string, unknown>;
+    if (obj['@type'] && typeof obj['@id'] === 'string') ids.push(obj['@id']);
+    for (const [k, val] of Object.entries(obj)) {
+      if (!k.startsWith('_')) walk(val);
+    }
+  };
+  walk(jsonld);
+  return ids;
+}
+
+function collectBareRefIds(jsonld: unknown): string[] {
+  const ids: string[] = [];
+  const walk = (v: unknown) => {
+    if (!v || typeof v !== 'object') return;
+    if (Array.isArray(v)) { v.forEach(walk); return; }
+    const obj = v as Record<string, unknown>;
+    if (typeof obj['@id'] === 'string' && !obj['@type']) ids.push(obj['@id']);
+    for (const [k, val] of Object.entries(obj)) {
+      if (!k.startsWith('_')) walk(val);
+    }
+  };
+  walk(jsonld);
+  return ids;
+}
+
+interface OrphanBlock {
+  projectId: string;
+  pageUrl: string;
+  referencingPages: string[];
+}
+
+function checkOrphanImpact(
+  toDelete: SchemaProject[],
+  allClientProjects: SchemaProject[],
+): { blocked: OrphanBlock[]; safe: SchemaProject[] } {
+  const toDeleteIds = new Set(toDelete.map(p => p.id));
+  const blocked: OrphanBlock[] = [];
+  const safe: SchemaProject[] = [];
+
+  for (const proj of toDelete) {
+    if (!proj.generated_jsonld) { safe.push(proj); continue; }
+    const definedIds = new Set(collectDefinedIds(proj.generated_jsonld));
+    if (definedIds.size === 0) { safe.push(proj); continue; }
+
+    const referencingPages: string[] = [];
+    for (const other of allClientProjects) {
+      if (toDeleteIds.has(other.id)) continue; // also being deleted — skip
+      if (!other.generated_jsonld) continue;
+      const bareRefs = collectBareRefIds(other.generated_jsonld);
+      if (bareRefs.some(id => definedIds.has(id))) {
+        referencingPages.push(other.page_url);
+      }
+    }
+
+    if (referencingPages.length > 0) {
+      blocked.push({ projectId: proj.id, pageUrl: proj.page_url, referencingPages });
+    } else {
+      safe.push(proj);
+    }
+  }
+
+  return { blocked, safe };
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+interface DeleteModal {
+  mode: 'single' | 'bulk';
+  candidates: SchemaProject[];
+  blocked: OrphanBlock[];
+  safe: SchemaProject[];
+}
+
 export default function ClientDetailPage() {
   const { id: clientId } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -41,12 +121,18 @@ export default function ClientDetailPage() {
   const [projects, setProjects] = useState<SchemaProject[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // New project modal
   const [showModal, setShowModal] = useState(false);
   const [newUrl, setNewUrl] = useState('');
   const [domainWarning, setDomainWarning] = useState(false);
   const [duplicate, setDuplicate] = useState<SchemaProject | null>(null);
   const [checkingDup, setCheckingDup] = useState(false);
   const dupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Selection + delete
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [deleteModal, setDeleteModal] = useState<DeleteModal | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const loadData = async () => {
     if (!clientId) return;
@@ -82,7 +168,6 @@ export default function ClientDetailPage() {
     if (client) {
       setDomainWarning(val.length > 8 && !sameDomain(client.website_url, val));
     }
-    // Debounced duplicate check
     if (dupTimerRef.current) clearTimeout(dupTimerRef.current);
     setDuplicate(null);
     if (!val || !clientId) return;
@@ -105,6 +190,47 @@ export default function ClientDetailPage() {
     closeModal();
     navigate(`/client/${clientId}/project/new?url=${encodeURIComponent(newUrl.trim())}`);
   };
+
+  // ── Selection ───────────────────────────────────────────────────────────────
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const allSelected = projects.length > 0 && selectedIds.size === projects.length;
+  const someSelected = selectedIds.size > 0 && !allSelected;
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(projects.map(p => p.id)));
+    }
+  };
+
+  // ── Delete ──────────────────────────────────────────────────────────────────
+
+  const initiateDelete = (candidates: SchemaProject[]) => {
+    const { blocked, safe } = checkOrphanImpact(candidates, projects);
+    setDeleteModal({ mode: candidates.length === 1 ? 'single' : 'bulk', candidates, blocked, safe });
+  };
+
+  const executeDelete = async () => {
+    if (!deleteModal || deleteModal.safe.length === 0) return;
+    setDeleting(true);
+    const ids = deleteModal.safe.map(p => p.id);
+    await supabase.from('schema_projects').delete().in('id', ids);
+    setDeleteModal(null);
+    setSelectedIds(new Set());
+    await loadData();
+    setDeleting(false);
+  };
+
+  const selectedProjects = projects.filter(p => selectedIds.has(p.id));
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -135,16 +261,10 @@ export default function ClientDetailPage() {
               </a>
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <Link
-                to={`/client/${client.id}/graph`}
-                className="btn-ghost text-xs py-1 px-2"
-              >
+              <Link to={`/client/${client.id}/graph`} className="btn-ghost text-xs py-1 px-2">
                 Consolidado
               </Link>
-              <Link
-                to={`/client/${client.id}/geo`}
-                className="btn-ghost text-xs py-1 px-2"
-              >
+              <Link to={`/client/${client.id}/geo`} className="btn-ghost text-xs py-1 px-2">
                 GEO
               </Link>
               <button onClick={openModal} className="btn-primary flex items-center gap-1.5 text-xs py-1.5 px-3">
@@ -158,11 +278,35 @@ export default function ClientDetailPage() {
 
       {/* Projects list */}
       <div className="proof-card">
+        {/* List header */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-rule">
-          <h2 className="section-title">Proyectos de schema</h2>
-          <span className="text-xs font-mono text-ink-muted">
-            {projects.length} proyecto{projects.length !== 1 ? 's' : ''}
-          </span>
+          <div className="flex items-center gap-3">
+            {projects.length > 0 && (
+              <input
+                type="checkbox"
+                checked={allSelected}
+                ref={el => { if (el) el.indeterminate = someSelected; }}
+                onChange={toggleSelectAll}
+                className="w-3.5 h-3.5 rounded border-rule accent-ink cursor-pointer"
+                title="Seleccionar todos"
+              />
+            )}
+            <h2 className="section-title">Proyectos de schema</h2>
+          </div>
+          <div className="flex items-center gap-3">
+            {selectedIds.size > 0 && (
+              <button
+                onClick={() => initiateDelete(selectedProjects)}
+                className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded border border-red-300 text-red-700 bg-red-50 hover:bg-red-100 transition-colors"
+              >
+                <Trash2 size={12} />
+                Eliminar seleccionados ({selectedIds.size})
+              </button>
+            )}
+            <span className="text-xs font-mono text-ink-muted">
+              {projects.length} proyecto{projects.length !== 1 ? 's' : ''}
+            </span>
+          </div>
         </div>
 
         {loading ? (
@@ -178,33 +322,60 @@ export default function ClientDetailPage() {
         ) : (
           <div className="divide-y divide-rule">
             {projects.map(proj => (
-              <Link
+              <div
                 key={proj.id}
-                to={`/client/${clientId}/project/${proj.id}`}
-                className="flex items-center gap-3 px-5 py-3.5 hover:bg-proof transition-colors group"
+                className={`flex items-center hover:bg-proof transition-colors ${selectedIds.has(proj.id) ? 'bg-blue-50 hover:bg-blue-50' : ''}`}
               >
-                <div className="flex-1 min-w-0">
-                  <span className="font-mono text-sm text-ink font-medium group-hover:text-blue transition-colors truncate block">
-                    {urlPath(proj.page_url)}
-                  </span>
-                  <span className="text-[10px] font-mono text-ink-muted truncate block">
-                    {proj.page_url}
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 shrink-0">
-                  {proj.schema_types.length > 0 && (
-                    <span className="text-xs font-mono text-ink-muted hidden sm:block">
-                      {proj.schema_types.join(' + ')}
+                {/* Checkbox */}
+                <label
+                  className="flex items-center pl-5 pr-2 py-3.5 cursor-pointer shrink-0"
+                  onClick={e => e.stopPropagation()}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(proj.id)}
+                    onChange={() => toggleSelect(proj.id)}
+                    className="w-3.5 h-3.5 rounded border-rule accent-ink cursor-pointer"
+                  />
+                </label>
+
+                {/* Main link */}
+                <Link
+                  to={`/client/${clientId}/project/${proj.id}`}
+                  className="flex-1 flex items-center gap-3 pr-3 py-3.5 min-w-0 group"
+                >
+                  <div className="flex-1 min-w-0">
+                    <span className="font-mono text-sm text-ink font-medium group-hover:text-blue transition-colors truncate block">
+                      {urlPath(proj.page_url)}
                     </span>
-                  )}
-                  <span className={`chip ${STATUS_CHIP[proj.status] ?? 'chip-ink'}`}>
-                    {STATUS_LABEL[proj.status] ?? proj.status}
-                  </span>
-                  <span className="text-xs font-mono text-ink-muted">
-                    {new Date(proj.created_at).toLocaleDateString('es-MX', { day: '2-digit', month: 'short', year: '2-digit' })}
-                  </span>
-                </div>
-              </Link>
+                    <span className="text-[10px] font-mono text-ink-muted truncate block">
+                      {proj.page_url}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    {proj.schema_types.length > 0 && (
+                      <span className="text-xs font-mono text-ink-muted hidden sm:block">
+                        {proj.schema_types.join(' + ')}
+                      </span>
+                    )}
+                    <span className={`chip ${STATUS_CHIP[proj.status] ?? 'chip-ink'}`}>
+                      {STATUS_LABEL[proj.status] ?? proj.status}
+                    </span>
+                    <span className="text-xs font-mono text-ink-muted">
+                      {new Date(proj.created_at).toLocaleDateString('es-MX', { day: '2-digit', month: 'short', year: '2-digit' })}
+                    </span>
+                  </div>
+                </Link>
+
+                {/* Delete button */}
+                <button
+                  onClick={e => { e.preventDefault(); e.stopPropagation(); initiateDelete([proj]); }}
+                  className="px-4 py-3.5 text-ink-muted hover:text-red-600 transition-colors shrink-0"
+                  title="Eliminar proyecto"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
             ))}
           </div>
         )}
@@ -233,7 +404,8 @@ export default function ClientDetailPage() {
                   autoFocus
                 />
                 <p className="text-[10px] font-mono text-ink-muted mt-1">
-                  Puedes editar la URL base para apuntar a una página específica, p. ej. <span className="text-ink">/contacto</span>
+                  Puedes editar la URL base para apuntar a una página específica, p. ej.{' '}
+                  <span className="text-ink">/contacto</span>
                 </p>
               </div>
 
@@ -277,6 +449,107 @@ export default function ClientDetailPage() {
               >
                 Crear proyecto
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete confirm modal */}
+      {deleteModal && (
+        <div className="fixed inset-0 bg-ink/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white border border-rule rounded w-full max-w-lg">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-rule">
+              <h2 className="font-semibold text-ink text-sm">
+                {deleteModal.mode === 'single' ? 'Eliminar proyecto' : `Eliminar proyectos (${deleteModal.candidates.length})`}
+              </h2>
+              <button onClick={() => setDeleteModal(null)} className="text-ink-muted hover:text-ink">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[60vh] overflow-y-auto">
+              {/* Safe to delete */}
+              {deleteModal.safe.length > 0 && (
+                <div>
+                  {deleteModal.mode === 'bulk' && deleteModal.blocked.length > 0 && (
+                    <p className="text-xs font-mono font-semibold text-ink mb-2">
+                      Se eliminarán {deleteModal.safe.length} proyecto{deleteModal.safe.length !== 1 ? 's' : ''}:
+                    </p>
+                  )}
+                  {deleteModal.mode === 'single' && (
+                    <p className="text-xs font-mono text-ink-muted mb-3">
+                      Esta acción no se puede deshacer.
+                    </p>
+                  )}
+                  <div className="space-y-2">
+                    {deleteModal.safe.map(proj => (
+                      <div key={proj.id} className="flex items-center gap-2 bg-proof rounded px-3 py-2">
+                        <span className="font-mono text-xs text-ink flex-1 truncate">{urlPath(proj.page_url)}</span>
+                        <span className={`chip ${STATUS_CHIP[proj.status] ?? 'chip-ink'} text-[10px]`}>
+                          {STATUS_LABEL[proj.status] ?? proj.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Blocked */}
+              {deleteModal.blocked.length > 0 && (
+                <div>
+                  <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded p-3 mb-2">
+                    <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
+                    <p className="text-xs font-mono text-amber-700">
+                      {deleteModal.mode === 'single'
+                        ? 'No se puede eliminar este proyecto.'
+                        : `${deleteModal.blocked.length} proyecto${deleteModal.blocked.length !== 1 ? 's' : ''} no se pueden eliminar:`}
+                    </p>
+                  </div>
+                  <div className="space-y-3">
+                    {deleteModal.blocked.map(b => (
+                      <div key={b.projectId} className="rounded border border-amber-200 bg-amber-50 px-3 py-2.5">
+                        <p className="font-mono text-xs text-ink font-medium mb-1">{urlPath(b.pageUrl)}</p>
+                        <p className="text-[10px] font-mono text-amber-700">
+                          Otras {b.referencingPages.length} página{b.referencingPages.length !== 1 ? 's' : ''} referencian la entidad de esta página —
+                          elimina o actualiza esas referencias primero.
+                        </p>
+                        <ul className="mt-1.5 space-y-0.5">
+                          {b.referencingPages.map(pg => (
+                            <li key={pg} className="text-[10px] font-mono text-amber-600">{urlPath(pg)}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* All blocked single */}
+              {deleteModal.safe.length === 0 && deleteModal.mode === 'single' && (
+                <p className="text-xs font-mono text-ink-muted">
+                  Actualiza las referencias en las páginas listadas antes de intentar eliminar este proyecto.
+                </p>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 px-5 py-4 border-t border-rule">
+              <button onClick={() => setDeleteModal(null)} className="btn-ghost">
+                Cancelar
+              </button>
+              {deleteModal.safe.length > 0 && (
+                <button
+                  onClick={executeDelete}
+                  disabled={deleting}
+                  className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded border border-red-400 text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Trash2 size={12} />
+                  {deleting
+                    ? 'Eliminando...'
+                    : deleteModal.mode === 'single'
+                    ? 'Eliminar'
+                    : `Eliminar ${deleteModal.safe.length} proyecto${deleteModal.safe.length !== 1 ? 's' : ''}`}
+                </button>
+              )}
             </div>
           </div>
         </div>
