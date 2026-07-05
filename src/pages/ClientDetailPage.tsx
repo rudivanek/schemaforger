@@ -321,7 +321,7 @@ export default function ClientDetailPage() {
             {selectedIds.size > 0 && (
               <button
                 onClick={() => initiateDelete(selectedProjects)}
-                className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded border border-red-300 text-red-700 bg-red-50 hover:bg-red-100 transition-colors"
+                className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded border border-red/40 text-red bg-red/8 hover:bg-red/15 transition-colors"
               >
                 <Trash2 size={12} />
                 Eliminar seleccionados ({selectedIds.size})
@@ -394,7 +394,7 @@ export default function ClientDetailPage() {
                 {/* Delete button */}
                 <button
                   onClick={e => { e.preventDefault(); e.stopPropagation(); initiateDelete([proj]); }}
-                  className="px-4 py-3.5 text-ink-muted hover:text-red-600 transition-colors shrink-0"
+                  className="px-4 py-3.5 text-ink-muted hover:text-red transition-colors shrink-0"
                   title="Eliminar proyecto"
                 >
                   <Trash2 size={13} />
@@ -564,7 +564,7 @@ export default function ClientDetailPage() {
                 <button
                   onClick={executeDelete}
                   disabled={deleting}
-                  className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded border border-red-400 text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded border border-red text-white bg-red hover:opacity-85 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
                 >
                   <Trash2 size={12} />
                   {deleting
