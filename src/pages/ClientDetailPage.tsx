@@ -136,6 +136,12 @@ export default function ClientDetailPage() {
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <Link
+                to={`/client/${client.id}/graph`}
+                className="btn-ghost text-xs py-1 px-2"
+              >
+                Consolidado
+              </Link>
+              <Link
                 to={`/client/${client.id}/geo`}
                 className="btn-ghost text-xs py-1 px-2"
               >

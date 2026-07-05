@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import ClientDetailPage from './pages/ClientDetailPage';
+import ClientGraphPage from './pages/ClientGraphPage';
 import ProjectWorkspace from './pages/ProjectWorkspace';
 import GeoAuditPage from './pages/GeoAuditPage';
 import TemplatesPage from './pages/TemplatesPage';
@@ -56,6 +57,14 @@ function AppRoutes() {
         element={
           <ProtectedRoute>
             <GeoAuditPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/client/:id/graph"
+        element={
+          <ProtectedRoute>
+            <ClientGraphPage />
           </ProtectedRoute>
         }
       />
