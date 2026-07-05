@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
+import type { Json } from '../lib/database.types';
 import type { Client, SchemaProject } from '../lib/database.types';
 import {
   ArrowLeft, CheckCircle, AlertTriangle, AlertCircle,
-  RefreshCw, ExternalLink, ChevronDown, ChevronUp,
+  RefreshCw, ExternalLink, ChevronDown, ChevronUp, Download,
+  X,
 } from 'lucide-react';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -48,6 +50,12 @@ interface LiveNodeResult {
   id: string;
   status: LiveStatus;
   diffs?: FieldDiff[];
+  liveNode?: Record<string, unknown>;
+}
+
+interface UntrackedNode {
+  node: Record<string, unknown>;
+  id?: string;
 }
 
 interface LivePageResult {
@@ -55,7 +63,21 @@ interface LivePageResult {
   pageUrl: string;
   overallStatus: LiveStatus;
   nodeResults: LiveNodeResult[];
+  untrackedNodes: UntrackedNode[];
   error?: string;
+}
+
+interface AdoptModifiedTarget {
+  projectId: string;
+  project: SchemaProject;
+  nodeId: string;
+  liveNode: Record<string, unknown>;
+  diffs: FieldDiff[];
+}
+
+interface AdoptUnknownTarget {
+  sourcePageUrl: string;
+  node: Record<string, unknown>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -166,6 +188,12 @@ function getSimilarityText(node: Record<string, unknown>): string {
     .join(' ');
 }
 
+function nodeSummary(node: Record<string, unknown>): string {
+  const v = node['name'] ?? node['headline'] ?? node['legalName'] ?? node['@id'];
+  if (!v) return '';
+  return typeof v === 'string' ? v : JSON.stringify(v);
+}
+
 async function runWithConcurrency<T>(
   tasks: (() => Promise<T>)[],
   limit: number,
@@ -193,6 +221,44 @@ function formatVal(v: unknown): string {
   if (v === undefined || v === null) return '—';
   if (typeof v === 'string') return v;
   return JSON.stringify(v);
+}
+
+function replaceNodeById(
+  jsonld: unknown,
+  targetId: string,
+  newNode: Record<string, unknown>,
+): unknown {
+  if (!jsonld || typeof jsonld !== 'object') return jsonld;
+  if (Array.isArray(jsonld)) {
+    return jsonld.map(item => replaceNodeById(item, targetId, newNode));
+  }
+  const obj = jsonld as Record<string, unknown>;
+  if (obj['@id'] === targetId && obj['@type']) return { ...newNode };
+  const result: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    result[k] = replaceNodeById(v, targetId, newNode);
+  }
+  return result;
+}
+
+function appendNodeToJsonld(jsonld: unknown, newNode: Record<string, unknown>): unknown {
+  if (!jsonld) return [newNode];
+  if (Array.isArray(jsonld)) return [...jsonld, newNode];
+  const obj = jsonld as Record<string, unknown>;
+  if (Array.isArray(obj['@graph'])) {
+    return { ...obj, '@graph': [...(obj['@graph'] as unknown[]), newNode] };
+  }
+  return [jsonld, newNode];
+}
+
+function appendOperatorNote(rawData: unknown, note: string): Record<string, unknown> {
+  const existing = ((rawData as Record<string, unknown>)?._operator_notes ?? []) as string[];
+  return { ...(rawData as object ?? {}), _operator_notes: [...existing, note] };
+}
+
+function adoptionNote(action: string, types: string[], id: string): string {
+  const date = new Date().toLocaleDateString('es-MX', { day: '2-digit', month: 'long', year: 'numeric' });
+  return `${action} el ${date}: nodo ${types.join('/')}#${id}`;
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -243,7 +309,7 @@ export default function ClientGraphPage() {
 
   const [client, setClient] = useState<Client | null>(null);
   const [projects, setProjects] = useState<SchemaProject[]>([]);  // validated/delivered with jsonld
-  const [allProjects, setAllProjects] = useState<SchemaProject[]>([]); // all projects for live check
+  const [allProjects, setAllProjects] = useState<SchemaProject[]>([]); // all statuses
   const [loading, setLoading] = useState(true);
 
   const [allFlatNodes, setAllFlatNodes] = useState<FlatNode[]>([]);
@@ -257,6 +323,12 @@ export default function ClientGraphPage() {
   const [liveRunning, setLiveRunning] = useState(false);
   const [collisionExpanded, setCollisionExpanded] = useState<Record<string, boolean>>({});
   const [liveExpanded, setLiveExpanded] = useState<Record<string, boolean>>({});
+
+  // Adopt actions
+  const [adoptModifiedModal, setAdoptModifiedModal] = useState<AdoptModifiedTarget | null>(null);
+  const [adoptUnknownModal, setAdoptUnknownModal] = useState<AdoptUnknownTarget | null>(null);
+  const [adoptTargetProjectId, setAdoptTargetProjectId] = useState<string>('');
+  const [adopting, setAdopting] = useState(false);
 
   useEffect(() => { loadData(); }, [clientId]);
 
@@ -376,6 +448,16 @@ export default function ClientGraphPage() {
     setLiveRunning(true);
     setLiveResults({});
 
+    // Build complete set of all @ids known in DB across ALL client projects (any status)
+    const allKnownIds = new Set<string>();
+    allProjects.forEach(p => {
+      if (!p.generated_jsonld) return;
+      collectTypedNodes(p.generated_jsonld, '', '').forEach(fn => {
+        const id = fn.node['@id'];
+        if (typeof id === 'string') allKnownIds.add(id);
+      });
+    });
+
     const validProjs = allProjects.filter(
       p => p.page_url && p.generated_jsonld && (p.status === 'validated' || p.status === 'delivered'),
     );
@@ -389,12 +471,15 @@ export default function ClientGraphPage() {
         if (error) throw error;
         const liveJsonld = data?.scraped?.existing_jsonld;
         const liveNodes = collectTypedNodes(liveJsonld ?? [], proj.page_url, proj.id);
+
+        // Build liveById for comparison against DB nodes
         const liveById = new Map<string, Record<string, unknown>>();
         liveNodes.forEach(fn => {
           const id = fn.node['@id'];
           if (typeof id === 'string') liveById.set(id, fn.node);
         });
 
+        // Compare DB nodes against live
         const genNodes = collectTypedNodes(proj.generated_jsonld, proj.page_url, proj.id);
         const nodeResults: LiveNodeResult[] = [];
         for (const fn of genNodes) {
@@ -406,9 +491,21 @@ export default function ClientGraphPage() {
           } else if (deepEqual(fn.node, live)) {
             nodeResults.push({ id, status: 'match' });
           } else {
-            nodeResults.push({ id, status: 'modified', diffs: diffNodes(fn.node, live) });
+            nodeResults.push({ id, status: 'modified', diffs: diffNodes(fn.node, live), liveNode: live });
           }
         }
+
+        // Detect untracked live nodes (not known to DB at all)
+        const untrackedNodes: UntrackedNode[] = [];
+        liveNodes.forEach(fn => {
+          const id = fn.node['@id'];
+          if (typeof id === 'string') {
+            if (!allKnownIds.has(id)) untrackedNodes.push({ node: fn.node, id });
+          } else {
+            // No @id — anonymous node, always surfaced for visibility
+            untrackedNodes.push({ node: fn.node, id: undefined });
+          }
+        });
 
         const overallStatus: LiveStatus =
           nodeResults.some(r => r.status === 'missing') ? 'missing'
@@ -417,12 +514,12 @@ export default function ClientGraphPage() {
 
         setLiveResults(prev => ({
           ...prev,
-          [proj.id]: { projectId: proj.id, pageUrl: proj.page_url, overallStatus, nodeResults },
+          [proj.id]: { projectId: proj.id, pageUrl: proj.page_url, overallStatus, nodeResults, untrackedNodes },
         }));
       } catch (e) {
         setLiveResults(prev => ({
           ...prev,
-          [proj.id]: { projectId: proj.id, pageUrl: proj.page_url, overallStatus: 'missing', nodeResults: [], error: String(e) },
+          [proj.id]: { projectId: proj.id, pageUrl: proj.page_url, overallStatus: 'missing', nodeResults: [], untrackedNodes: [], error: String(e) },
         }));
       }
       setLiveLoading(prev => ({ ...prev, [proj.id]: false }));
@@ -433,7 +530,67 @@ export default function ClientGraphPage() {
     setLiveRunning(false);
   };
 
-  // Group flat nodes by page
+  const openAdoptUnknown = (node: Record<string, unknown>, sourcePageUrl: string) => {
+    const defaultProj = allProjects.find(p => p.page_url === sourcePageUrl) ?? allProjects[0];
+    setAdoptTargetProjectId(defaultProj?.id ?? '');
+    setAdoptUnknownModal({ sourcePageUrl, node });
+  };
+
+  const handleAdoptModified = async () => {
+    if (!adoptModifiedModal || adopting) return;
+    setAdopting(true);
+    const { project, nodeId, liveNode } = adoptModifiedModal;
+
+    const newJsonld = replaceNodeById(project.generated_jsonld, nodeId, liveNode);
+    const note = adoptionNote(
+      'Adoptado desde el sitio en vivo',
+      getNodeTypes(liveNode),
+      nodeId,
+    );
+    const newRawData = appendOperatorNote(project.raw_scraped_data, note);
+
+    await supabase.from('schema_projects').update({
+      generated_jsonld: newJsonld as Json,
+      raw_scraped_data: newRawData as Json,
+      status: 'draft',
+    }).eq('id', project.id);
+
+    setAdoptModifiedModal(null);
+    setAdopting(false);
+    await loadData();
+    setLiveResults({});
+    setLiveTimestamp(null);
+  };
+
+  const handleAdoptUnknown = async () => {
+    if (!adoptUnknownModal || !adoptTargetProjectId || adopting) return;
+    setAdopting(true);
+    const { node } = adoptUnknownModal;
+
+    const targetProject = allProjects.find(p => p.id === adoptTargetProjectId);
+    if (!targetProject) { setAdopting(false); return; }
+
+    const newJsonld = appendNodeToJsonld(targetProject.generated_jsonld, node);
+    const id = typeof node['@id'] === 'string' ? node['@id'] : '(sin @id)';
+    const note = adoptionNote('Adoptado desde el sitio en vivo', getNodeTypes(node), id);
+    const newRawData = appendOperatorNote(targetProject.raw_scraped_data, note);
+
+    await supabase.from('schema_projects').update({
+      generated_jsonld: newJsonld as Json,
+      raw_scraped_data: newRawData as Json,
+      status: 'draft',
+    }).eq('id', targetProject.id);
+
+    setAdoptUnknownModal(null);
+    setAdoptTargetProjectId('');
+    setAdopting(false);
+    await loadData();
+    setLiveResults({});
+    setLiveTimestamp(null);
+  };
+
+  // ── Derived ───────────────────────────────────────────────────────────────────
+
   const nodesByPage = new Map<string, { project: SchemaProject; nodes: FlatNode[] }>();
   projects.forEach(proj => {
     const nodes = allFlatNodes.filter(fn => fn.sourceProjectId === proj.id);
@@ -443,7 +600,8 @@ export default function ClientGraphPage() {
   const totalIssues = collisions.length + duplicates.length + orphanedRefs.length;
   const liveCheckCompleted = liveTimestamp !== null;
   const liveProjectCount = Object.keys(liveResults).length;
-  const allMatch = liveCheckCompleted && liveProjectCount > 0 && Object.values(liveResults).every(r => r.overallStatus === 'match');
+  const allMatch = liveCheckCompleted && liveProjectCount > 0 &&
+    Object.values(liveResults).every(r => r.overallStatus === 'match' && r.untrackedNodes.length === 0);
   const draftCount = allProjects.filter(p => p.status === 'draft').length;
 
   if (loading) {
@@ -562,8 +720,6 @@ export default function ClientGraphPage() {
               </div>
             ) : (
               <div className="divide-y divide-rule">
-
-                {/* @id collisions */}
                 {collisions.map((col, idx) => {
                   const key = `col-${idx}`;
                   const expanded = !!collisionExpanded[key];
@@ -607,7 +763,6 @@ export default function ClientGraphPage() {
                   );
                 })}
 
-                {/* Possible duplicates */}
                 {duplicates.map((dup, idx) => (
                   <div key={`dup-${idx}`} className="p-5">
                     <div className="flex items-start gap-3">
@@ -644,7 +799,6 @@ export default function ClientGraphPage() {
                   </div>
                 ))}
 
-                {/* Orphaned references */}
                 {orphanedRefs.map((ref, idx) => (
                   <div key={`orphan-${idx}`} className="p-5">
                     <div className="flex items-start gap-3">
@@ -705,7 +859,7 @@ export default function ClientGraphPage() {
                 {allMatch && !liveRunning && (
                   <div className="flex items-center gap-2.5 px-5 py-5">
                     <CheckCircle size={15} className="text-green shrink-0" />
-                    <span className="text-sm font-mono text-green">Todo el schema en vivo coincide con lo generado.</span>
+                    <span className="text-sm font-mono text-green">Todo el schema en vivo coincide con lo generado. Sin nodos desconocidos.</span>
                   </div>
                 )}
 
@@ -736,13 +890,18 @@ export default function ClientGraphPage() {
                       },
                     };
 
+                    const hasUntracked = result && result.untrackedNodes.length > 0;
+                    const nonMatchNodes = result?.nodeResults.filter(r => r.status !== 'match') ?? [];
+
                     return (
                       <div key={proj.id} className="p-5">
                         <div className="flex items-start gap-3">
                           {isLoading ? (
                             <RefreshCw size={14} className="text-ink-muted shrink-0 mt-0.5 animate-spin" />
                           ) : result ? (
-                            statusConfig[result.overallStatus].icon
+                            hasUntracked && result.overallStatus === 'match'
+                              ? <AlertTriangle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+                              : statusConfig[result.overallStatus].icon
                           ) : null}
 
                           <div className="flex-1 min-w-0">
@@ -763,7 +922,8 @@ export default function ClientGraphPage() {
                               <p className="text-xs font-mono text-red mt-1">{result.error}</p>
                             )}
 
-                            {!isLoading && result && !result.error && result.nodeResults.length > 0 && result.overallStatus !== 'match' && (
+                            {/* Known-node diffs (modified / missing) */}
+                            {!isLoading && result && !result.error && nonMatchNodes.length > 0 && (
                               <>
                                 <button
                                   type="button"
@@ -771,26 +931,88 @@ export default function ClientGraphPage() {
                                   className="flex items-center gap-1.5 text-xs font-mono text-ink-muted hover:text-ink mt-1.5"
                                 >
                                   {isExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-                                  {result.nodeResults.filter(r => r.status !== 'match').length} nodo{result.nodeResults.filter(r => r.status !== 'match').length !== 1 ? 's' : ''} con diferencias
+                                  {nonMatchNodes.length} nodo{nonMatchNodes.length !== 1 ? 's' : ''} con diferencias
                                 </button>
                                 {isExpanded && (
-                                  <div className="mt-2 space-y-3">
-                                    {result.nodeResults
-                                      .filter(r => r.status !== 'match')
-                                      .map(nr => (
-                                        <div key={nr.id}>
-                                          <div className="flex items-center gap-2 mb-1">
+                                  <div className="mt-2 space-y-4">
+                                    {nonMatchNodes.map(nr => (
+                                      <div key={nr.id} className="border border-rule rounded p-3">
+                                        <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
+                                          <div className="flex items-center gap-2">
                                             <span className={`text-[10px] font-mono font-semibold uppercase tracking-wider ${nr.status === 'missing' ? 'text-red' : 'text-amber-700'}`}>
                                               {nr.status === 'missing' ? 'No encontrado' : 'Modificado'}
                                             </span>
                                             <span className="text-[10px] font-mono text-ink-muted break-all">{nr.id}</span>
                                           </div>
-                                          {nr.diffs && nr.diffs.length > 0 && <DiffTable diffs={nr.diffs} />}
+                                          {nr.status === 'modified' && nr.liveNode && (
+                                            <button
+                                              type="button"
+                                              onClick={() => setAdoptModifiedModal({
+                                                projectId: proj.id,
+                                                project: allProjects.find(p => p.id === proj.id)!,
+                                                nodeId: nr.id,
+                                                liveNode: nr.liveNode!,
+                                                diffs: nr.diffs ?? [],
+                                              })}
+                                              className="flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded border border-blue/40 text-blue bg-blue/8 hover:bg-blue/15 transition-colors shrink-0"
+                                            >
+                                              <Download size={10} />
+                                              Adoptar versión en vivo
+                                            </button>
+                                          )}
                                         </div>
-                                      ))}
+                                        {nr.diffs && nr.diffs.length > 0 && <DiffTable diffs={nr.diffs} />}
+                                      </div>
+                                    ))}
                                   </div>
                                 )}
                               </>
+                            )}
+
+                            {/* Untracked live nodes */}
+                            {!isLoading && hasUntracked && (
+                              <div className="mt-3 border border-amber-200 rounded overflow-hidden">
+                                <div className="bg-amber-50 px-3 py-2 border-b border-amber-200">
+                                  <p className="text-[10px] font-mono font-semibold text-amber-700 uppercase tracking-wider">
+                                    Nodos no rastreados en vivo ({result!.untrackedNodes.length})
+                                  </p>
+                                  <p className="text-[10px] font-mono text-amber-600 mt-0.5">
+                                    Estos nodos existen en el sitio pero no fueron generados por SchemaForge — pueden venir de un plugin, edición manual, u otro origen.
+                                  </p>
+                                </div>
+                                <div className="divide-y divide-amber-100 bg-white">
+                                  {result!.untrackedNodes.map((un, uidx) => {
+                                    const types = getNodeTypes(un.node);
+                                    const summary = nodeSummary(un.node);
+                                    return (
+                                      <div key={uidx} className="px-3 py-2.5 flex items-center justify-between gap-3">
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-1.5 flex-wrap">
+                                            <span className="text-[10px] font-mono font-semibold text-amber-700 uppercase tracking-wider">
+                                              {types.length > 0 ? types.join(' / ') : '(sin @type)'}
+                                            </span>
+                                            {un.id
+                                              ? <span className="text-[10px] font-mono text-ink-muted truncate">{un.id}</span>
+                                              : <span className="text-[10px] font-mono text-ink-muted italic">sin @id</span>
+                                            }
+                                          </div>
+                                          {summary && (
+                                            <p className="text-[10px] font-mono text-ink-muted mt-0.5 truncate">{summary}</p>
+                                          )}
+                                        </div>
+                                        <button
+                                          type="button"
+                                          onClick={() => openAdoptUnknown(un.node, proj.page_url)}
+                                          className="flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded border border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100 transition-colors shrink-0"
+                                        >
+                                          <Download size={10} />
+                                          Adoptar versión en vivo
+                                        </button>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
                             )}
                           </div>
 
@@ -808,6 +1030,134 @@ export default function ClientGraphPage() {
             )}
           </div>
         </>
+      )}
+
+      {/* ── Adopt-modified modal ─────────────────────────────────────────────── */}
+      {adoptModifiedModal && (
+        <div className="fixed inset-0 bg-ink/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white border border-rule rounded w-full max-w-xl max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-rule shrink-0">
+              <h2 className="font-semibold text-ink text-sm">Adoptar versión en vivo</h2>
+              <button onClick={() => setAdoptModifiedModal(null)} className="text-ink-muted hover:text-ink">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 overflow-y-auto flex-1">
+              <div className="bg-proof rounded px-3 py-2">
+                <p className="text-[10px] font-mono text-ink-muted mb-0.5">Nodo</p>
+                <p className="text-xs font-mono text-ink break-all">{adoptModifiedModal.nodeId}</p>
+              </div>
+
+              <div>
+                <p className="text-[10px] font-mono font-semibold text-ink-muted uppercase tracking-wider mb-1.5">Diferencias detectadas</p>
+                <DiffTable diffs={adoptModifiedModal.diffs} />
+              </div>
+
+              <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded p-3">
+                <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
+                <p className="text-xs font-mono text-amber-700">
+                  Esto reemplazará el contenido guardado con lo que existe actualmente en el sitio.
+                  El proyecto se marcará como borrador para revalidar.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 px-5 py-4 border-t border-rule shrink-0">
+              <button onClick={() => setAdoptModifiedModal(null)} className="btn-ghost">Cancelar</button>
+              <button
+                onClick={handleAdoptModified}
+                disabled={adopting}
+                className="btn-primary flex items-center gap-1.5"
+              >
+                <Download size={13} />
+                {adopting ? 'Adoptando...' : 'Adoptar versión en vivo'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Adopt-unknown modal ──────────────────────────────────────────────── */}
+      {adoptUnknownModal && (
+        <div className="fixed inset-0 bg-ink/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white border border-rule rounded w-full max-w-lg max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-rule shrink-0">
+              <h2 className="font-semibold text-ink text-sm">Adoptar nodo desconocido</h2>
+              <button onClick={() => setAdoptUnknownModal(null)} className="text-ink-muted hover:text-ink">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 overflow-y-auto flex-1">
+              {/* Node preview */}
+              <div>
+                <p className="text-[10px] font-mono font-semibold text-ink-muted uppercase tracking-wider mb-1.5">Nodo detectado</p>
+                <div className="bg-proof rounded px-3 py-2 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-ink-muted">@type:</span>
+                    <span className="text-xs font-mono text-ink">
+                      {getNodeTypes(adoptUnknownModal.node).join(' / ') || '—'}
+                    </span>
+                  </div>
+                  {typeof adoptUnknownModal.node['@id'] === 'string' && (
+                    <div className="flex items-start gap-2">
+                      <span className="text-[10px] font-mono text-ink-muted shrink-0">@id:</span>
+                      <span className="text-xs font-mono text-ink break-all">{adoptUnknownModal.node['@id'] as string}</span>
+                    </div>
+                  )}
+                  {nodeSummary(adoptUnknownModal.node) && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-mono text-ink-muted">nombre:</span>
+                      <span className="text-xs font-mono text-ink truncate">{nodeSummary(adoptUnknownModal.node)}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Project selector */}
+              <div>
+                <label className="field-label">Agregar a proyecto</label>
+                <select
+                  value={adoptTargetProjectId}
+                  onChange={e => setAdoptTargetProjectId(e.target.value)}
+                  className="input-field w-full font-mono text-sm"
+                >
+                  {allProjects.length === 0 && (
+                    <option value="">Sin proyectos disponibles</option>
+                  )}
+                  {allProjects.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {urlPath(p.page_url)} — {p.status === 'draft' ? 'Borrador' : p.status === 'validated' ? 'Validado' : 'Entregado'}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[10px] font-mono text-ink-muted mt-1">
+                  El nodo se añadirá al JSON-LD del proyecto seleccionado y se marcará como borrador.
+                </p>
+              </div>
+
+              <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded p-3">
+                <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
+                <p className="text-xs font-mono text-amber-700">
+                  Este nodo no fue generado por SchemaForge. Verifica su contenido antes de validarlo.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 px-5 py-4 border-t border-rule shrink-0">
+              <button onClick={() => setAdoptUnknownModal(null)} className="btn-ghost">Cancelar</button>
+              <button
+                onClick={handleAdoptUnknown}
+                disabled={adopting || !adoptTargetProjectId}
+                className="btn-primary flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Download size={13} />
+                {adopting ? 'Adoptando...' : 'Adoptar nodo'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
