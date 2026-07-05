@@ -12,14 +12,15 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    const { scraped, template, extra_info } = await req.json();
+    const { scraped, template, extra_info, main_entity } = await req.json();
     // scraped: output of scrape-site
     // template: the schema_templates row for the chosen vertical
     // extra_info: optional free-text corrections/additions typed by you
+    // main_entity?: { id, type, name } — present on secondary pages to avoid duplicating the business entity
 
     if (!scraped || !template) return json({ error: "scraped and template required" }, 400);
 
-    const systemPrompt = buildSystemPrompt(template);
+    const systemPrompt = buildSystemPrompt(template, main_entity ?? null);
     const userPrompt = buildUserPrompt(scraped, extra_info);
 
     const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -67,13 +68,20 @@ Deno.serve(async (req) => {
 // The prompt template — this encodes the domain judgment
 // ============================================================
 
-function buildSystemPrompt(template: {
-  vertical: string;
-  schema_type_combo: string[];
-  required_fields: Record<string, string[]>;
-  recommended_fields: Record<string, string[]>;
-  prompt_notes: string | null;
-}): string {
+function buildSystemPrompt(
+  template: {
+    vertical: string;
+    schema_type_combo: string[];
+    required_fields: Record<string, string[]>;
+    recommended_fields: Record<string, string[]>;
+    prompt_notes: string | null;
+  },
+  mainEntity: { id: string; type: string; name: string } | null,
+): string {
+  const secondaryPageRule = mainEntity
+    ? `\n8. SECONDARY PAGE MODE: The business entity already exists in the site's schema as ${mainEntity.type} with @id '${mainEntity.id}' (${mainEntity.name}), defined on the site's main page. Do NOT create a new ${mainEntity.type} node and do NOT repeat its address, telephone, hours, or other business-level properties. Instead: (a) generate only the page-specific types appropriate to THIS page's content (e.g. MedicalProcedure, Service, FAQPage, ContactPage, Physician as main entity of a bio page); (b) wherever a node needs to point to the business (provider, performer, worksFor, publisher, about, parentOrganization), use a bare reference: {"@id": "${mainEntity.id}"}; (c) if this page's content contradicts the main entity's data, do not resolve it silently — flag it in _operator_notes.`
+    : "";
+
   return `You are a technical SEO specialist generating Schema.org JSON-LD markup.
 
 TARGET SCHEMA TYPES for this ${template.vertical} business:
@@ -95,7 +103,7 @@ HARD RULES:
 4. Phone numbers in international format (+52 for Mexico) when the country is identifiable.
 5. openingHoursSpecification only if hours are explicitly stated in the source.
 6. If the page already contains JSON-LD (provided in input), do not duplicate its nodes — extend or correct instead, and note conflicts in a top-level "_operator_notes" string field.
-7. Output ONLY the JSON object. No markdown fences, no preamble, no explanation. The only allowed non-schema field is "_operator_notes" (a string with warnings for the human reviewer: missing required fields, mismatches with visible content, existing schema conflicts). The frontend strips this field before export.`;
+7. Output ONLY the JSON object. No markdown fences, no preamble, no explanation. The only allowed non-schema field is "_operator_notes" (a string with warnings for the human reviewer: missing required fields, mismatches with visible content, existing schema conflicts). The frontend strips this field before export.${secondaryPageRule}`;
 }
 
 function buildUserPrompt(scraped: unknown, extraInfo?: string): string {
