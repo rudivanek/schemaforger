@@ -76,6 +76,18 @@ function checkOrphanImpact(
   allClientProjects: SchemaProject[],
 ): { blocked: OrphanBlock[]; safe: SchemaProject[] } {
   const toDeleteIds = new Set(toDelete.map(p => p.id));
+
+  // Build a map: @id → set of project IDs that define it (across ALL projects)
+  const definersOf = new Map<string, Set<string>>();
+  for (const proj of allClientProjects) {
+    if (!proj.generated_jsonld) continue;
+    for (const id of collectDefinedIds(proj.generated_jsonld)) {
+      const s = definersOf.get(id) ?? new Set();
+      s.add(proj.id);
+      definersOf.set(id, s);
+    }
+  }
+
   const blocked: OrphanBlock[] = [];
   const safe: SchemaProject[] = [];
 
@@ -84,12 +96,24 @@ function checkOrphanImpact(
     const definedIds = new Set(collectDefinedIds(proj.generated_jsonld));
     if (definedIds.size === 0) { safe.push(proj); continue; }
 
+    // Collect @ids that would become UNDEFINED after deletion
+    // (proj is the last/sole definer, no surviving project also defines it)
+    const wouldBeUndefined = new Set<string>();
+    for (const id of definedIds) {
+      const definers = definersOf.get(id) ?? new Set();
+      const survivingDefiners = [...definers].filter(pid => pid !== proj.id && !toDeleteIds.has(pid));
+      if (survivingDefiners.length === 0) wouldBeUndefined.add(id);
+    }
+
+    if (wouldBeUndefined.size === 0) { safe.push(proj); continue; }
+
+    // Check if any surviving project references one of the now-undefined @ids
     const referencingPages: string[] = [];
     for (const other of allClientProjects) {
-      if (toDeleteIds.has(other.id)) continue; // also being deleted — skip
+      if (toDeleteIds.has(other.id)) continue;
       if (!other.generated_jsonld) continue;
       const bareRefs = collectBareRefIds(other.generated_jsonld);
-      if (bareRefs.some(id => definedIds.has(id))) {
+      if (bareRefs.some(id => wouldBeUndefined.has(id))) {
         referencingPages.push(other.page_url);
       }
     }
