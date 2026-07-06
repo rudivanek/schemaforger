@@ -1,7 +1,7 @@
 // supabase/functions/generate-schema/index.ts
 // Sends scraped data + vertical template to Claude, returns validated-shape JSON-LD.
-// Deploy: supabase functions deploy generate-schema
-// Secret:  supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
+// Appends opportunity nodes (BreadcrumbList, FAQPage, VideoObject, etc.) built deterministically
+// from extracted_data — never invented by the model.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,12 +12,7 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    const { scraped, template, extra_info, main_entity } = await req.json();
-    // scraped: output of scrape-site
-    // template: the schema_templates row for the chosen vertical
-    // extra_info: optional free-text corrections/additions typed by you
-    // main_entity?: { id, type, name } — present on secondary pages to avoid duplicating the business entity
-
+    const { scraped, template, extra_info, main_entity, included_opportunities } = await req.json();
     if (!scraped || !template) return json({ error: "scraped and template required" }, 400);
 
     const systemPrompt = buildSystemPrompt(template, main_entity ?? null);
@@ -51,11 +46,21 @@ Deno.serve(async (req) => {
       .replace(/```json|```/g, "")
       .trim();
 
-    let jsonld: unknown;
+    let jsonld: Record<string, unknown>;
     try {
-      jsonld = stripPlaceholders(JSON.parse(raw));
+      jsonld = stripPlaceholders(JSON.parse(raw)) as Record<string, unknown>;
     } catch {
       return json({ error: "Model returned non-JSON output", raw }, 422);
+    }
+
+    // Append opportunity nodes built deterministically from extracted_data
+    if (Array.isArray(included_opportunities) && included_opportunities.length > 0) {
+      const pageUrl: string = scraped?.page_url ?? "";
+      const mainEntityId = findMainEntityId(jsonld, main_entity);
+      const oppNodes = buildOpportunityNodes(included_opportunities, pageUrl, mainEntityId);
+      if (oppNodes.length > 0) {
+        jsonld = mergeIntoGraph(jsonld, oppNodes);
+      }
     }
 
     return json({ jsonld });
@@ -64,9 +69,155 @@ Deno.serve(async (req) => {
   }
 });
 
-// ============================================================
-// The prompt template — this encodes the domain judgment
-// ============================================================
+// ── Opportunity node builders ─────────────────────────────────────────────────
+
+interface IncludedOpportunity {
+  detector_id: string;
+  extracted_data: unknown;
+}
+
+function findMainEntityId(
+  jsonld: Record<string, unknown>,
+  mainEntity?: { id: string } | null,
+): string | undefined {
+  if (mainEntity?.id) return mainEntity.id;
+  const graph = jsonld["@graph"];
+  if (Array.isArray(graph)) {
+    for (const node of graph) {
+      const n = node as Record<string, unknown>;
+      if (typeof n["@id"] === "string") return n["@id"];
+    }
+  }
+  if (typeof jsonld["@id"] === "string") return jsonld["@id"];
+  return undefined;
+}
+
+function mergeIntoGraph(jsonld: Record<string, unknown>, nodes: unknown[]): Record<string, unknown> {
+  if (Array.isArray(jsonld["@graph"])) {
+    return { ...jsonld, "@graph": [...(jsonld["@graph"] as unknown[]), ...nodes] };
+  }
+  const ctx = jsonld["@context"] ?? "https://schema.org";
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { "@context": _ctx, ...rest } = jsonld;
+  return { "@context": ctx, "@graph": [rest, ...nodes] };
+}
+
+function buildOpportunityNodes(
+  included: IncludedOpportunity[],
+  pageUrl: string,
+  mainEntityId: string | undefined,
+): unknown[] {
+  const nodes: unknown[] = [];
+
+  for (const opp of included) {
+    switch (opp.detector_id) {
+      case "breadcrumb": {
+        const trail = opp.extracted_data as string[] | null;
+        if (!Array.isArray(trail) || trail.length < 2) break;
+        nodes.push({
+          "@type": "BreadcrumbList",
+          "@id": `${pageUrl}#breadcrumb`,
+          "itemListElement": trail.map((name, idx) => ({
+            "@type": "ListItem",
+            "position": idx + 1,
+            "name": name,
+          })),
+        });
+        break;
+      }
+
+      case "faq": {
+        const pairs = opp.extracted_data as Array<{ question: string; answer: string }> | null;
+        if (!Array.isArray(pairs) || pairs.length === 0) break;
+        const faqNode: Record<string, unknown> = {
+          "@type": "FAQPage",
+          "@id": `${pageUrl}#faq`,
+          "mainEntity": pairs.map(p => ({
+            "@type": "Question",
+            "name": p.question,
+            "acceptedAnswer": { "@type": "Answer", "text": p.answer },
+          })),
+        };
+        if (mainEntityId) faqNode["about"] = { "@id": mainEntityId };
+        nodes.push(faqNode);
+        break;
+      }
+
+      case "video": {
+        const video = opp.extracted_data as { url: string; title?: string } | null;
+        if (!video?.url) break;
+        const videoNode: Record<string, unknown> = {
+          "@type": "VideoObject",
+          "@id": `${pageUrl}#video`,
+          "embedUrl": video.url,
+        };
+        if (video.title) videoNode["name"] = video.title;
+        if (mainEntityId) videoNode["publisher"] = { "@id": mainEntityId };
+        nodes.push(videoNode);
+        break;
+      }
+
+      case "reviews_unmarked": {
+        const reviews = opp.extracted_data as Array<{ text: string; author?: string; rating?: number }> | null;
+        if (!Array.isArray(reviews)) break;
+        reviews.forEach((r, i) => {
+          const review: Record<string, unknown> = {
+            "@type": "Review",
+            "@id": `${pageUrl}#review-${i}`,
+            "reviewBody": r.text,
+          };
+          if (r.author) review["author"] = { "@type": "Person", "name": r.author };
+          // Only add numeric rating if explicitly present per review; no fabricated AggregateRating
+          if (r.rating) review["reviewRating"] = { "@type": "Rating", "ratingValue": r.rating, "bestRating": 5 };
+          if (mainEntityId) review["itemReviewed"] = { "@id": mainEntityId };
+          nodes.push(review);
+        });
+        break;
+      }
+
+      case "howto": {
+        const steps = opp.extracted_data as Array<{ name: string; text?: string }> | null;
+        if (!Array.isArray(steps) || steps.length < 3) break;
+        const howtoNode: Record<string, unknown> = {
+          "@type": "HowTo",
+          "@id": `${pageUrl}#howto`,
+          "step": steps.map((s, i) => ({
+            "@type": "HowToStep",
+            "position": i + 1,
+            "name": s.name,
+            ...(s.text ? { "text": s.text } : {}),
+          })),
+        };
+        if (mainEntityId) howtoNode["provider"] = { "@id": mainEntityId };
+        nodes.push(howtoNode);
+        break;
+      }
+
+      case "jobposting": {
+        const jobs = opp.extracted_data as Array<{ title: string; description?: string }> | null;
+        if (!Array.isArray(jobs)) break;
+        jobs.forEach((j, i) => {
+          const job: Record<string, unknown> = {
+            "@type": "JobPosting",
+            "@id": `${pageUrl}#job-${i}`,
+            "title": j.title,
+          };
+          if (j.description) job["description"] = j.description;
+          if (mainEntityId) job["hiringOrganization"] = { "@id": mainEntityId };
+          nodes.push(job);
+        });
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  return nodes;
+}
+
+// ── Prompt builders ───────────────────────────────────────────────────────────
 
 function buildSystemPrompt(
   template: {
@@ -111,8 +262,7 @@ function buildUserPrompt(scraped: unknown, extraInfo?: string): string {
   return `SCRAPED PAGE DATA:
 ${JSON.stringify(scraped, null, 2)}
 
-${extraInfo ? `OPERATOR NOTES / CORRECTIONS (authoritative — overrides scraped data on conflict):\n${extraInfo}\n` : ""}
-Generate the JSON-LD now.`;
+${extraInfo ? `OPERATOR NOTES / CORRECTIONS (authoritative — overrides scraped data on conflict):\n${extraInfo}\n` : ""}Generate the JSON-LD now.`;
 }
 
 function json(body: unknown, status = 200) {
@@ -123,24 +273,17 @@ function json(body: unknown, status = 200) {
 }
 
 function isPlaceholder(v: string): boolean {
-  // Normalize underscores, hyphens, and whitespace runs to single spaces so
-  // "OPERATOR_MUST_SUPPLY" matches the same as "OPERATOR MUST SUPPLY".
-  const n = v.replace(/[_\-\s]+/g, ' ').trim();
-
+  const n = v.replace(/[_\-\s]+/g, " ").trim();
   if (/OPERATOR\s+MUST|PLACEHOLDER/i.test(n)) return true;
   if (/\bTODO\b|\bFIXME\b|\bXXX\b/.test(n)) return true;
-
-  // Heuristic: 3+ all-caps words (letters + spaces only) containing a sentinel verb.
-  if (/^[A-Z ]+$/.test(n) && n.split(' ').length >= 3) {
+  if (/^[A-Z ]+$/.test(n) && n.split(" ").length >= 3) {
     if (/\b(MUST|SUPPLY|REQUIRED|INSERT|ENTER|FILL)\b/.test(n)) return true;
   }
-
   return false;
 }
 
 function stripPlaceholders(obj: unknown): unknown {
   const removed: string[] = [];
-
   const walk = (v: unknown, path: string): unknown => {
     if (Array.isArray(v)) return v.map((item, i) => walk(item, `${path}[${i}]`));
     if (v && typeof v === "object") {
@@ -157,14 +300,11 @@ function stripPlaceholders(obj: unknown): unknown {
     }
     return v;
   };
-
   const result = walk(obj, "") as Record<string, unknown>;
-
   if (removed.length > 0) {
     const note = removed.map(p => `Se removió un marcador del campo "${p}"`).join("\n");
     const existing = typeof result._operator_notes === "string" ? result._operator_notes : "";
     result._operator_notes = existing ? `${existing}\n${note}` : note;
   }
-
   return result;
 }

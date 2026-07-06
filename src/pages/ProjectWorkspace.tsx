@@ -45,6 +45,15 @@ function stripJsonPlaceholders(obj: unknown): unknown {
 
 type SchemaSource = 'yoast' | 'rankmath' | 'other' | 'none';
 
+interface OpportunityResult {
+  detector_id: string;
+  label_es: string;
+  status: 'detected' | 'not_detected';
+  actionable: boolean;
+  extracted_data: unknown | null;
+  suggestion_es: string;
+}
+
 interface ScrapedData {
   page_url?: string;
   title?: string;
@@ -62,6 +71,7 @@ interface ScrapedData {
   detected_schema_types?: string[];
   schema_source?: SchemaSource;
   conflict_types?: string[];
+  opportunities?: OpportunityResult[];
 }
 
 // Schema.org types that describe a business/organization entity.
@@ -140,6 +150,70 @@ function extractMainEntityFromJsonLd(
   return { id, type: primaryType, name };
 }
 
+// ── OpportunityPreview ────────────────────────────────────────────────────────
+
+function OpportunityPreview({ opp }: { opp: OpportunityResult }) {
+  if (!opp.extracted_data) return null;
+  switch (opp.detector_id) {
+    case 'breadcrumb': {
+      const trail = opp.extracted_data as string[];
+      return <p className="text-[10px] font-mono text-ink-muted mt-1">{trail.join(' › ')}</p>;
+    }
+    case 'faq': {
+      const pairs = opp.extracted_data as { question: string }[];
+      return (
+        <div className="mt-1 space-y-0.5">
+          {pairs.slice(0, 3).map((p, i) => (
+            <p key={i} className="text-[10px] font-mono text-ink-muted truncate">· {p.question}</p>
+          ))}
+          {pairs.length > 3 && <p className="text-[10px] font-mono text-ink-muted">... y {pairs.length - 3} más</p>}
+        </div>
+      );
+    }
+    case 'video': {
+      const v = opp.extracted_data as { url: string; title?: string };
+      return <p className="text-[10px] font-mono text-ink-muted mt-1 truncate">{v.title ?? v.url}</p>;
+    }
+    case 'reviews_unmarked': {
+      const reviews = opp.extracted_data as { text: string; author?: string }[];
+      return (
+        <div className="mt-1 space-y-0.5">
+          {reviews.slice(0, 2).map((r, i) => (
+            <p key={i} className="text-[10px] font-mono text-ink-muted truncate">
+              {r.author ? `"${r.text.slice(0, 55)}..." — ${r.author}` : `"${r.text.slice(0, 75)}..."`}
+            </p>
+          ))}
+        </div>
+      );
+    }
+    case 'howto': {
+      const steps = opp.extracted_data as { name: string }[];
+      return (
+        <div className="mt-1 space-y-0.5">
+          {steps.slice(0, 3).map((s, i) => (
+            <p key={i} className="text-[10px] font-mono text-ink-muted truncate">{i + 1}. {s.name}</p>
+          ))}
+          {steps.length > 3 && <p className="text-[10px] font-mono text-ink-muted">... y {steps.length - 3} más</p>}
+        </div>
+      );
+    }
+    case 'jobposting': {
+      const jobs = opp.extracted_data as { title: string }[];
+      return (
+        <div className="mt-1 space-y-0.5">
+          {jobs.slice(0, 3).map((j, i) => (
+            <p key={i} className="text-[10px] font-mono text-ink-muted truncate">· {j.title}</p>
+          ))}
+          {jobs.length > 3 && <p className="text-[10px] font-mono text-ink-muted">... y {jobs.length - 3} más</p>}
+        </div>
+      );
+    }
+    default: return null;
+  }
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+
 export default function ProjectWorkspace() {
   const { id: clientId, projectId } = useParams<{ id: string; projectId: string }>();
   const navigate = useNavigate();
@@ -158,6 +232,7 @@ export default function ProjectWorkspace() {
   const [operatorNotes, setOperatorNotes] = useState('');
   const [duplicateProject, setDuplicateProject] = useState<SchemaProject | null>(null);
   const dupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [includedOpportunities, setIncludedOpportunities] = useState<string[]>([]);
 
   // Secondary-page entity reference
   const [mainEntity, setMainEntity] = useState<{ id: string; type: string; name: string } | null>(null);
@@ -196,7 +271,15 @@ export default function ProjectWorkspace() {
       if (proj) {
         setProject(proj);
         setPageUrl(proj.page_url);
-        if (proj.raw_scraped_data) setScraped(proj.raw_scraped_data as ScrapedData);
+        if (proj.raw_scraped_data) {
+          const s = proj.raw_scraped_data as ScrapedData;
+          setScraped(s);
+          if (s.opportunities) {
+            setIncludedOpportunities(
+              s.opportunities.filter(o => o.status === 'detected' && o.actionable).map(o => o.detector_id)
+            );
+          }
+        }
 
         // Load template before initialising edited fields so missing-field detection works
         let tmpl: SchemaTemplate | null = null;
@@ -322,12 +405,14 @@ export default function ProjectWorkspace() {
       if (!data?.scraped) throw new Error('Respuesta inesperada del servidor');
       const s = data.scraped as ScrapedData;
       s.detected_schema_types = collectTypesFromJsonLd(s.existing_jsonld);
-      // Compute conflict list: entity types that clash with what we'll generate
       const willGenerateEntity = (template?.schema_type_combo ?? []).some(isBusinessEntity);
-      s.conflict_types = willGenerateEntity
-        ? s.detected_schema_types.filter(isBusinessEntity)
-        : [];
+      s.conflict_types = willGenerateEntity ? s.detected_schema_types.filter(isBusinessEntity) : [];
       setScraped(s);
+      if (s.opportunities) {
+        setIncludedOpportunities(
+          s.opportunities.filter(o => o.status === 'detected' && o.actionable).map(o => o.detector_id)
+        );
+      }
       await persistProject({ page_url: pageUrl, raw_scraped_data: s as unknown as import('../lib/database.types').Json });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Error al escanear';
@@ -348,6 +433,9 @@ export default function ProjectWorkspace() {
           template,
           extra_info: operatorNotes,
           ...(mainEntity ? { main_entity: mainEntity } : {}),
+          included_opportunities: (scraped?.opportunities ?? [])
+            .filter(o => o.status === 'detected' && o.actionable && includedOpportunities.includes(o.detector_id))
+            .map(o => ({ detector_id: o.detector_id, extracted_data: o.extracted_data })),
         },
       });
       if (error) throw error;
@@ -722,6 +810,75 @@ export default function ProjectWorkspace() {
               })()}
             </div>
           )}
+
+          {/* ── Oportunidades detectadas ──────────────────────────────────── */}
+          {scraped && scraped.opportunities && scraped.opportunities.length > 0 && (() => {
+            const actionableCount = scraped.opportunities.filter(o => o.status === 'detected' && o.actionable).length;
+            return (
+              <div className="proof-card p-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <h2 className="section-title">Oportunidades detectadas</h2>
+                  {actionableCount > 0 && (
+                    <span className="chip chip-blue text-[10px]">{actionableCount} disponible{actionableCount !== 1 ? 's' : ''}</span>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  {scraped.opportunities.map(opp => {
+                    if (opp.status === 'not_detected') {
+                      // breadcrumb/faq — always show advisory
+                      return (
+                        <div key={opp.detector_id} className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded p-3">
+                          <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="text-xs font-mono font-semibold text-amber-700">{opp.label_es} — no detectado</p>
+                            <p className="text-[11px] font-mono text-amber-600 mt-0.5 leading-relaxed">{opp.suggestion_es}</p>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (opp.actionable) {
+                      const checked = includedOpportunities.includes(opp.detector_id);
+                      return (
+                        <label key={opp.detector_id} className="flex items-start gap-2.5 border border-blue/30 bg-blue/5 rounded p-3 cursor-pointer hover:bg-blue/8 transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={e => setIncludedOpportunities(prev =>
+                              e.target.checked ? [...prev, opp.detector_id] : prev.filter(id => id !== opp.detector_id)
+                            )}
+                            className="mt-0.5 shrink-0 accent-blue-600"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-0.5">
+                              <span className="text-xs font-mono font-semibold text-blue">{opp.label_es}</span>
+                              <span className="chip chip-blue text-[10px]">Detectado</span>
+                            </div>
+                            <p className="text-[11px] font-mono text-ink-muted">{opp.suggestion_es}</p>
+                            <OpportunityPreview opp={opp} />
+                          </div>
+                        </label>
+                      );
+                    }
+
+                    // Detected but not actionable (couldn't extract structured data)
+                    return (
+                      <div key={opp.detector_id} className="flex items-start gap-2.5 border border-blue/20 rounded p-3">
+                        <CheckCircle size={13} className="text-blue/60 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="flex items-center gap-2 mb-0.5">
+                            <span className="text-xs font-mono font-semibold text-blue/70">{opp.label_es}</span>
+                            <span className="text-[10px] font-mono text-blue/50 border border-blue/20 rounded px-1.5 py-0.5">Detectado</span>
+                          </div>
+                          <p className="text-[11px] font-mono text-ink-muted">{opp.suggestion_es}</p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
 
           {scraped && (
             <div className="proof-card p-5">
