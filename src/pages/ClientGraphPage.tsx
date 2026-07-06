@@ -6,7 +6,7 @@ import type { Client, SchemaProject } from '../lib/database.types';
 import {
   ArrowLeft, CheckCircle, AlertTriangle, AlertCircle,
   RefreshCw, ExternalLink, ChevronDown, ChevronUp, Download,
-  X,
+  X, Globe, Search, Plus,
 } from 'lucide-react';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -56,6 +56,26 @@ interface LiveNodeResult {
 interface UntrackedNode {
   node: Record<string, unknown>;
   id?: string;
+}
+
+// ── Discovery types ───────────────────────────────────────────────────────────
+
+type DiscoveryStatus = 'no_overlap' | 'match' | 'conflict';
+
+interface DiscoveryConflict {
+  id: string;
+  knownProjectId: string;
+  knownPageUrl: string;
+  knownNode: Record<string, unknown>;
+  liveNode: Record<string, unknown>;
+  diffs: FieldDiff[];
+}
+
+interface DiscoveryPageResult {
+  url: string;
+  status: DiscoveryStatus;
+  conflicts: DiscoveryConflict[];
+  error?: string;
 }
 
 interface LivePageResult {
@@ -261,6 +281,38 @@ function adoptionNote(action: string, types: string[], id: string): string {
   return `${action} el ${date}: nodo ${types.join('/')}#${id}`;
 }
 
+function crossCheckJsonld(
+  scannedUrl: string,
+  scannedJsonld: unknown,
+  knownNodes: Map<string, { node: Record<string, unknown>; projectId: string; pageUrl: string }>,
+): DiscoveryPageResult {
+  const liveNodes = collectTypedNodes(scannedJsonld ?? [], scannedUrl, '');
+  const conflicts: DiscoveryConflict[] = [];
+  let hasOverlap = false;
+  for (const fn of liveNodes) {
+    const id = fn.node['@id'];
+    if (typeof id !== 'string') continue;
+    const known = knownNodes.get(id);
+    if (!known) continue;
+    hasOverlap = true;
+    if (!deepEqual(fn.node, known.node)) {
+      conflicts.push({
+        id,
+        knownProjectId: known.projectId,
+        knownPageUrl: known.pageUrl,
+        knownNode: known.node,
+        liveNode: fn.node,
+        diffs: diffNodes(known.node, fn.node),
+      });
+    }
+  }
+  return {
+    url: scannedUrl,
+    status: !hasOverlap ? 'no_overlap' : conflicts.length > 0 ? 'conflict' : 'match',
+    conflicts,
+  };
+}
+
 // ── Sub-components ────────────────────────────────────────────────────────────
 
 function DiffTable({ diffs }: { diffs: FieldDiff[] }) {
@@ -297,6 +349,453 @@ function IdDiffTable({ diffs }: { diffs: FieldDiff[] }) {
           <span className="text-orange truncate">{formatVal(d.liveVal)}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+// ── SiteDiscoverySection ──────────────────────────────────────────────────────
+
+function SiteDiscoverySection({
+  clientId,
+  client,
+  allProjects,
+  onProjectCreated,
+}: {
+  clientId: string;
+  client: Client;
+  allProjects: SchemaProject[];
+  onProjectCreated: () => Promise<void>;
+}) {
+  const navigate = useNavigate();
+
+  const [expanded, setExpanded] = useState(false);
+
+  // Full-site discovery
+  const [discovering, setDiscovering] = useState(false);
+  const [discoveredPages, setDiscoveredPages] = useState<Array<{ url: string; hasProject: boolean }> | null>(null);
+  const [discoveryMeta, setDiscoveryMeta] = useState<{ source: string; total: number; truncated: boolean } | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // Scanning
+  const [scanStatus, setScanStatus] = useState<Record<string, 'scanning' | 'done' | 'error'>>({});
+  const [results, setResults] = useState<Record<string, DiscoveryPageResult>>({});
+  const [scanning, setScanning] = useState(false);
+
+  // Manual entry
+  const [manualInput, setManualInput] = useState('');
+  const [scanningManual, setScanningManual] = useState(false);
+
+  // Create project
+  const [creatingProject, setCreatingProject] = useState<string | null>(null);
+
+  const buildKnownNodes = () => {
+    const map = new Map<string, { node: Record<string, unknown>; projectId: string; pageUrl: string }>();
+    allProjects.forEach(p => {
+      if (!p.generated_jsonld) return;
+      collectTypedNodes(p.generated_jsonld, p.page_url, p.id).forEach(fn => {
+        const id = fn.node['@id'];
+        if (typeof id === 'string' && !map.has(id)) {
+          map.set(id, { node: fn.node, projectId: p.id, pageUrl: p.page_url });
+        }
+      });
+    });
+    return map;
+  };
+
+  const handleDiscoverSite = async () => {
+    setDiscovering(true);
+    setDiscoveryError(null);
+    setDiscoveredPages(null);
+    setDiscoveryMeta(null);
+    setResults({});
+    setScanStatus({});
+    setSelected(new Set());
+    try {
+      const { data, error } = await supabase.functions.invoke('discover-site-pages', {
+        body: { site_url: client.website_url },
+      });
+      if (error) throw error;
+      if (data?.error) throw new Error(data.error);
+      const projectUrls = new Set(allProjects.map(p => p.page_url));
+      const pages = (data.pages as string[]).map(url => ({
+        url,
+        hasProject: projectUrls.has(url),
+      }));
+      setDiscoveredPages(pages);
+      setDiscoveryMeta({ source: data.source, total: data.total_found, truncated: !!data.truncated });
+      setSelected(new Set(pages.filter(p => !p.hasProject).map(p => p.url)));
+    } catch (e) {
+      setDiscoveryError(e instanceof Error ? e.message : String(e));
+    }
+    setDiscovering(false);
+  };
+
+  const runScanUrls = async (urls: string[]) => {
+    const knownNodes = buildKnownNodes();
+    setScanStatus(prev => {
+      const next = { ...prev };
+      urls.forEach(u => { next[u] = 'scanning'; });
+      return next;
+    });
+    const tasks = urls.map(url => async () => {
+      try {
+        const { data, error } = await supabase.functions.invoke('scrape-site', { body: { url } });
+        if (error) throw error;
+        const liveJsonld = data?.scraped?.existing_jsonld ?? [];
+        const result = crossCheckJsonld(url, liveJsonld, knownNodes);
+        setResults(prev => ({ ...prev, [url]: result }));
+        setScanStatus(prev => ({ ...prev, [url]: 'done' }));
+      } catch (e) {
+        setResults(prev => ({ ...prev, [url]: { url, status: 'no_overlap', conflicts: [], error: String(e) } }));
+        setScanStatus(prev => ({ ...prev, [url]: 'error' }));
+      }
+    });
+    await runWithConcurrency(tasks, 3);
+  };
+
+  const handleScanSelected = async () => {
+    const urls = [...selected];
+    if (!urls.length) return;
+    setScanning(true);
+    await runScanUrls(urls);
+    setScanning(false);
+  };
+
+  const parsedManualUrls = manualInput
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && /^https?:\/\//.test(l));
+
+  let clientHostname = '';
+  try { clientHostname = new URL(client.website_url).hostname; } catch { /* ok */ }
+  const offDomain = parsedManualUrls.filter(u => { try { return new URL(u).hostname !== clientHostname; } catch { return true; } });
+
+  const handleScanManual = async () => {
+    if (!parsedManualUrls.length || parsedManualUrls.length > 20) return;
+    setScanningManual(true);
+    await runScanUrls(parsedManualUrls);
+    setScanningManual(false);
+  };
+
+  const handleCreateProject = async (pageUrl: string) => {
+    if (creatingProject) return;
+    setCreatingProject(pageUrl);
+    const { data } = await supabase
+      .from('schema_projects')
+      .insert({ client_id: clientId, page_url: pageUrl, schema_types: [], status: 'draft' as const })
+      .select()
+      .maybeSingle();
+    setCreatingProject(null);
+    if (data) {
+      await onProjectCreated();
+      navigate(`/client/${clientId}/project/${data.id}`);
+    }
+  };
+
+  const resultEntries = Object.values(results);
+  const conflictResults = resultEntries.filter(r => r.status === 'conflict');
+  const matchResults = resultEntries.filter(r => r.status === 'match');
+  const noOverlapResults = resultEntries.filter(r => r.status === 'no_overlap' && !r.error);
+  const errorResults = resultEntries.filter(r => r.error);
+
+  const sourceLabel: Record<string, string> = {
+    firecrawl_map: 'Firecrawl Map',
+    sitemap: 'sitemap.xml',
+    sitemap_index: 'Sitemap Index',
+  };
+
+  const isScanning = scanning || scanningManual || Object.values(scanStatus).some(s => s === 'scanning');
+  const totalSelected = selected.size;
+
+  return (
+    <div className="proof-card">
+      <div className="px-5 py-3 border-b border-rule flex items-center justify-between gap-3">
+        <div>
+          <h2 className="section-title">Descubrimiento de sitio completo</h2>
+          <p className="text-[10px] font-mono text-ink-muted mt-0.5">
+            Encuentra schema en páginas no rastreadas que podría colisionar con proyectos existentes.
+          </p>
+        </div>
+        <button
+          onClick={() => setExpanded(v => !v)}
+          className="btn-ghost flex items-center gap-1.5 shrink-0"
+        >
+          <Globe size={13} />
+          {expanded ? 'Colapsar' : 'Iniciar descubrimiento'}
+          {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="p-5 space-y-6">
+
+          {/* ── Path A: Full-site discovery ──────────────────────────────────── */}
+          <div className="space-y-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <button
+                onClick={handleDiscoverSite}
+                disabled={discovering}
+                className="btn-primary flex items-center gap-2 shrink-0"
+              >
+                <RefreshCw size={13} className={discovering ? 'animate-spin' : ''} />
+                {discovering ? 'Descubriendo...' : 'Escanear sitio completo'}
+              </button>
+              {discoveryMeta && (
+                <span className="text-[10px] font-mono text-ink-muted">
+                  {discoveryMeta.total} páginas encontradas
+                  {' · '}fuente: <span className="text-ink">{sourceLabel[discoveryMeta.source] ?? discoveryMeta.source}</span>
+                  {discoveryMeta.truncated && <span className="text-amber-600"> · truncado a 200</span>}
+                </span>
+              )}
+            </div>
+
+            {discoveryError && (
+              <p className="text-xs font-mono text-red flex items-center gap-1.5">
+                <AlertCircle size={12} /> {discoveryError}
+              </p>
+            )}
+
+            {discoveredPages !== null && discoveredPages.length > 0 && (
+              <div className="border border-rule rounded overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2 bg-proof border-b border-rule">
+                  <span className="text-[10px] font-mono text-ink-muted">
+                    {totalSelected} de {discoveredPages.filter(p => !p.hasProject).length} páginas nuevas seleccionadas
+                  </span>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setSelected(new Set(discoveredPages.filter(p => !p.hasProject).map(p => p.url)))}
+                      className="text-[10px] font-mono text-blue hover:underline"
+                    >
+                      Seleccionar todas
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelected(new Set())}
+                      className="text-[10px] font-mono text-ink-muted hover:text-ink hover:underline"
+                    >
+                      Deseleccionar
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-52 overflow-y-auto divide-y divide-rule">
+                  {discoveredPages.map(p => (
+                    <label
+                      key={p.url}
+                      className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-proof/60 transition-colors ${p.hasProject ? 'opacity-50 cursor-default' : ''}`}
+                    >
+                      <input
+                        type="checkbox"
+                        disabled={p.hasProject}
+                        checked={selected.has(p.url)}
+                        onChange={e => {
+                          setSelected(prev => {
+                            const next = new Set(prev);
+                            e.target.checked ? next.add(p.url) : next.delete(p.url);
+                            return next;
+                          });
+                        }}
+                        className="shrink-0"
+                      />
+                      <span className="text-xs font-mono text-ink truncate">{urlPath(p.url)}</span>
+                      {p.hasProject && (
+                        <span className="text-[10px] font-mono text-ink-muted italic shrink-0">ya tiene proyecto</span>
+                      )}
+                    </label>
+                  ))}
+                </div>
+                <div className="px-3 py-2.5 border-t border-rule flex items-center gap-3 bg-proof/40">
+                  <button
+                    onClick={handleScanSelected}
+                    disabled={scanning || totalSelected === 0}
+                    className="btn-primary flex items-center gap-2 text-xs disabled:opacity-50"
+                  >
+                    <Search size={13} className={scanning ? 'animate-pulse' : ''} />
+                    {scanning ? 'Escaneando...' : `Escanear páginas seleccionadas (${totalSelected})`}
+                  </button>
+                  {totalSelected > 10 && (
+                    <span className="text-[10px] font-mono text-ink-muted">
+                      {totalSelected} páginas — puede tardar unos minutos
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ── Divider ──────────────────────────────────────────────────────── */}
+          <div className="flex items-center gap-3">
+            <div className="flex-1 border-t border-rule" />
+            <span className="text-[10px] font-mono text-ink-muted px-1">o ingresa URLs manualmente</span>
+            <div className="flex-1 border-t border-rule" />
+          </div>
+
+          {/* ── Path B: Manual URL entry ──────────────────────────────────────── */}
+          <div className="space-y-2">
+            <label className="field-label">URLs específicas a revisar (una por línea)</label>
+            <textarea
+              value={manualInput}
+              onChange={e => setManualInput(e.target.value)}
+              rows={4}
+              placeholder={"https://ejemplo.com/page-1\nhttps://ejemplo.com/page-2"}
+              className="input-field w-full font-mono text-xs resize-y"
+            />
+            {parsedManualUrls.length > 20 && (
+              <p className="text-xs font-mono text-red flex items-center gap-1.5">
+                <AlertCircle size={12} />
+                Máximo 20 URLs por lote — usa el escaneo de sitio completo para más.
+              </p>
+            )}
+            {offDomain.length > 0 && parsedManualUrls.length <= 20 && (
+              <p className="text-xs font-mono text-amber-700 flex items-center gap-1.5">
+                <AlertTriangle size={12} />
+                {offDomain.length} URL{offDomain.length !== 1 ? 's' : ''} fuera del dominio del cliente.
+              </p>
+            )}
+            <button
+              onClick={handleScanManual}
+              disabled={scanningManual || parsedManualUrls.length === 0 || parsedManualUrls.length > 20}
+              className="btn-ghost flex items-center gap-2 disabled:opacity-50"
+            >
+              <Search size={13} className={scanningManual ? 'animate-pulse' : ''} />
+              {scanningManual
+                ? 'Verificando...'
+                : `Verificar estas URLs (${parsedManualUrls.length})`}
+            </button>
+          </div>
+
+          {/* ── Results ──────────────────────────────────────────────────────── */}
+          {Object.keys(scanStatus).length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] font-mono font-semibold text-ink-muted uppercase tracking-wider">
+                  Resultados ({Object.keys(scanStatus).length} páginas)
+                </p>
+                {conflictResults.length > 0 && (
+                  <span className="chip chip-red text-[10px]">
+                    {conflictResults.length} conflicto{conflictResults.length !== 1 ? 's' : ''}
+                  </span>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                {/* Show in order: scanning first, then conflicts, matches, no_overlap, errors */}
+                {Object.entries(scanStatus)
+                  .sort(([, a], [, b]) => {
+                    const order = { scanning: 0, error: 1, done: 2 };
+                    return order[a] - order[b];
+                  })
+                  .map(([url, status]) => {
+                    const result = results[url];
+
+                    if (status === 'scanning') {
+                      return (
+                        <div key={url} className="flex items-center gap-2 px-3 py-2 border border-rule rounded text-xs font-mono text-ink-muted">
+                          <RefreshCw size={12} className="animate-spin shrink-0" />
+                          <span className="truncate">{urlPath(url)}</span>
+                        </div>
+                      );
+                    }
+
+                    if (!result) return null;
+
+                    if (result.error) {
+                      return (
+                        <div key={url} className="flex items-center gap-2 px-3 py-2 border border-rule rounded text-xs font-mono text-orange">
+                          <AlertCircle size={12} className="shrink-0" />
+                          <span className="truncate flex-1">{urlPath(url)}</span>
+                          <span className="text-[10px] text-ink-muted truncate max-w-xs">{result.error}</span>
+                        </div>
+                      );
+                    }
+
+                    if (result.status === 'no_overlap') {
+                      return (
+                        <div key={url} className="flex items-center gap-2 px-3 py-2 border border-rule rounded text-xs font-mono text-ink-muted">
+                          <CheckCircle size={12} className="text-ink-muted shrink-0" />
+                          <span className="truncate flex-1">{urlPath(url)}</span>
+                          <span className="text-[10px] italic">sin coincidencias con proyectos existentes</span>
+                        </div>
+                      );
+                    }
+
+                    if (result.status === 'match') {
+                      return (
+                        <div key={url} className="flex items-center gap-2 px-3 py-2 border border-rule rounded text-xs font-mono text-green">
+                          <CheckCircle size={12} className="shrink-0" />
+                          <span className="truncate flex-1">{urlPath(url)}</span>
+                          <span className="text-[10px]">Coincide — schema consistente</span>
+                        </div>
+                      );
+                    }
+
+                    // conflict
+                    return (
+                      <div key={url} className="border border-red/30 rounded overflow-hidden">
+                        <div className="flex items-center justify-between gap-3 px-3 py-2.5 bg-red/5">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <AlertCircle size={13} className="text-red shrink-0" />
+                            <span className="text-xs font-mono font-semibold text-red uppercase tracking-wider shrink-0">CONFLICTO</span>
+                            <span className="text-xs font-mono text-ink truncate">{urlPath(url)}</span>
+                          </div>
+                          {!allProjects.find(p => p.page_url === url) && (
+                            <button
+                              onClick={() => handleCreateProject(url)}
+                              disabled={!!creatingProject}
+                              className="flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded border border-blue/40 text-blue bg-blue/8 hover:bg-blue/15 transition-colors shrink-0 disabled:opacity-50"
+                            >
+                              <Plus size={10} />
+                              {creatingProject === url ? 'Creando...' : 'Crear proyecto'}
+                            </button>
+                          )}
+                        </div>
+                        <div className="divide-y divide-red/10">
+                          {result.conflicts.map((c, ci) => (
+                            <div key={ci} className="px-3 py-2.5">
+                              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                                <span className="text-[10px] font-mono text-ink-muted">@id:</span>
+                                <span className="text-[10px] font-mono text-ink break-all">{c.id}</span>
+                                <span className="text-[10px] font-mono text-ink-muted">·</span>
+                                <span className="text-[10px] font-mono text-ink-muted">
+                                  colisiona con{' '}
+                                  <Link
+                                    to={`/client/${clientId}/project/${c.knownProjectId}`}
+                                    className="text-blue hover:underline"
+                                  >
+                                    {urlPath(c.knownPageUrl)}
+                                  </Link>
+                                </span>
+                              </div>
+                              <DiffTable diffs={c.diffs} />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+
+              {/* Summary counts */}
+              {!isScanning && resultEntries.length > 0 && (
+                <div className="flex items-center gap-4 pt-1 text-[10px] font-mono text-ink-muted">
+                  {conflictResults.length > 0 && <span className="text-red">{conflictResults.length} conflicto{conflictResults.length !== 1 ? 's' : ''}</span>}
+                  {matchResults.length > 0 && <span className="text-green">{matchResults.length} coincidencia{matchResults.length !== 1 ? 's' : ''}</span>}
+                  {noOverlapResults.length > 0 && <span>{noOverlapResults.length} sin coincidencias</span>}
+                  {errorResults.length > 0 && <span className="text-orange">{errorResults.length} error{errorResults.length !== 1 ? 'es' : ''}</span>}
+                  <button
+                    type="button"
+                    onClick={() => { setResults({}); setScanStatus({}); }}
+                    className="ml-auto hover:text-ink underline"
+                  >
+                    Limpiar resultados
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1029,6 +1528,16 @@ export default function ClientGraphPage() {
               </div>
             )}
           </div>
+
+          {/* ── Section 4: Site discovery ────────────────────────────────────── */}
+          {client && (
+            <SiteDiscoverySection
+              clientId={clientId!}
+              client={client}
+              allProjects={allProjects}
+              onProjectCreated={loadData}
+            />
+          )}
         </>
       )}
 
