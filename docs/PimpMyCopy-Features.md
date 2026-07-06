@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T21:00:00Z
+**Last Updated:** 2026-07-06T21:30:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -161,6 +161,21 @@ Returns `SitemapCheck`: `{ found, source, actual_sitemap_url, url_count, referen
 - "Ejecuta auditoría" placeholder when no audit data yet
 
 **Recommendations** (`buildRecommendations`): sitemap section replaces the old robots `has_sitemap` rec. Old audits (no `sitemap_check`) fall back to the robots version. Sitemap recs include a "Ver sitemap abajo" scroll link. Missing-pages recs: ≤3 → one per page; >3 → grouped.
+
+### 4i. robots.txt Disallow path annotations
+
+`unusual_disallows` changed from `string[]` to `{ path: string; note: string | null }[]`. The new `annotateDisallow(path)` function in the edge function pattern-matches common path types and returns a short advisory note in Spanish, or `null` if no pattern fits:
+
+| Pattern | Note |
+|---|---|
+| refer / ref / tracking / utm | Rutas de referidos/tracking suelen ser intencionales |
+| docs / documentation / internal / private / admin (non-wp) | Verifica si contiene documentación privada o contenido indexable |
+| test / staging / dev / sandbox | Probablemente entorno de pruebas |
+| cart / checkout / account / login | Rutas de cuenta/checkout — normalmente correcto |
+| search / ?s= / filter | Bloquear búsquedas internas es práctica común |
+| no match | `null` — no note shown |
+
+**GeoAuditPage**: Per-path rendering in the "Rutas bloqueadas" section — each flagged path gets its own chip, and if `note` is non-null, a small italic line appears directly below that chip. Paths without a matched note show no extra text. The overall framing ("confirma que no ocultan contenido indexable") remains as section header. No fix/edit buttons — advisory only.
 
 ### 4d. Storage
 

@@ -349,15 +349,35 @@ function findBlockedAiCrawlers(robots: string): string[] {
 interface RobotsChecklist {
   has_sitemap: boolean;
   sitemap_url: string | null;
-  unusual_disallows: string[];
+  unusual_disallows: { path: string; note: string | null }[];
   high_crawl_delay: { agent: string; delay: number }[];
+}
+
+function annotateDisallow(path: string): string | null {
+  const p = path.toLowerCase();
+  if (p.includes("refer") || p.includes("ref") || p.includes("tracking") || p.includes("utm")) {
+    return "Los bloqueos de rutas de referidos/tracking suelen ser intencionales — no necesariamente ocultan contenido real.";
+  }
+  if (p.includes("docs") || p.includes("documentation") || p.includes("internal") || p.includes("private") || (p.includes("admin") && !p.startsWith("/wp-admin"))) {
+    return "Verifica si esta carpeta contiene documentación interna que debe permanecer privada, o contenido público que quieres que las IA puedan citar.";
+  }
+  if (p.includes("test") || p.includes("staging") || p.includes("dev") || p.includes("sandbox")) {
+    return "Probablemente un entorno de pruebas — normalmente correcto mantenerlo bloqueado.";
+  }
+  if (p.includes("cart") || p.includes("checkout") || p.includes("account") || p.includes("login")) {
+    return "Rutas de cuenta/checkout suelen bloquearse intencionalmente por privacidad — normalmente correcto.";
+  }
+  if (p.includes("search") || p.includes("?s=") || p.includes("filter")) {
+    return "Bloquear resultados de búsqueda internos es una práctica común y normalmente correcta.";
+  }
+  return null;
 }
 
 function analyzeRobotsTxt(robots: string): RobotsChecklist {
   const lines = robots.split(/\r?\n/).map((l) => l.trim());
   let has_sitemap = false;
   let sitemap_url: string | null = null;
-  const unusual_disallows: string[] = [];
+  const unusual_disallows: { path: string; note: string | null }[] = [];
   const high_crawl_delay: { agent: string; delay: number }[] = [];
   let currentAgents: string[] = [];
   let groupOpen = false;
@@ -383,7 +403,9 @@ function analyzeRobotsTxt(robots: string): RobotsChecklist {
     }
     if (key === "disallow") {
       if (value && value !== "/" && !NON_CONTENT_PATH.test(value)) {
-        if (!unusual_disallows.includes(value)) unusual_disallows.push(value);
+        if (!unusual_disallows.some((d) => d.path === value)) {
+          unusual_disallows.push({ path: value, note: annotateDisallow(value) });
+        }
       }
       groupOpen = false;
     } else if (key === "crawl-delay") {

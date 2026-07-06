@@ -25,7 +25,7 @@ interface SitemapCheck {
 interface RobotsChecklist {
   has_sitemap: boolean;
   sitemap_url: string | null;
-  unusual_disallows: string[];
+  unusual_disallows: { path: string; note: string | null }[];
   high_crawl_delay: { agent: string; delay: number }[];
 }
 
@@ -218,7 +218,7 @@ function buildRecommendations(
     if (rc.unusual_disallows.length > 0) {
       add({
         tier: 1,
-        text: `Revisa las rutas bloqueadas en robots.txt: ${rc.unusual_disallows.join(', ')} — confirma que no estén ocultando contenido que quieres que las IA vean.`,
+        text: `Revisa las rutas bloqueadas en robots.txt: ${rc.unusual_disallows.map(d => d.path).join(', ')} — confirma que no estén ocultando contenido que quieres que las IA vean.`,
       });
     }
   }
@@ -766,17 +766,20 @@ export default function GeoAuditPage() {
                   <div className="mt-2">
                     <div className="flex items-start gap-2">
                       <AlertTriangle size={12} className="text-amber-500 shrink-0 mt-0.5" />
-                      <div className="min-w-0">
+                      <div className="min-w-0 space-y-2">
                         <p className="text-[11px] font-mono text-amber-700">
                           Rutas bloqueadas para revisar — confirma que no ocultan contenido indexable:
                         </p>
-                        <div className="flex flex-wrap gap-1 mt-1">
-                          {display.robots_checklist.unusual_disallows.map(p => (
-                            <code key={p} className="text-[10px] font-mono bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 text-amber-800">
-                              {p}
+                        {display.robots_checklist.unusual_disallows.map(({ path, note }) => (
+                          <div key={path}>
+                            <code className="text-[10px] font-mono bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 text-amber-800">
+                              {path}
                             </code>
-                          ))}
-                        </div>
+                            {note && (
+                              <p className="text-[10px] font-mono text-amber-600 mt-0.5 ml-0.5">{note}</p>
+                            )}
+                          </div>
+                        ))}
                       </div>
                     </div>
                   </div>
