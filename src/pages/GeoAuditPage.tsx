@@ -153,9 +153,6 @@ function buildRecommendations(
     const presentTypes = collectTypesInJsonLd(proj.generated_jsonld);
     const linkTo = `/client/${proj.client_id}/project/${proj.id}`;
 
-    // eslint-disable-next-line no-console
-    console.log('[GEO Recs] project:', proj.page_url, 'opportunities:', scraped.opportunities, 'presentTypes:', [...presentTypes]);
-
     for (const opp of scraped.opportunities) {
       if (opp.status === 'not_detected') {
         add({

@@ -93,11 +93,18 @@ function detectBreadcrumb(html: string, doc: Doc): OpportunityResult {
 
 interface QAPair { question: string; answer: string; }
 
+// Returns true only if the text looks like a genuine question:
+// ends with "?" OR starts with a recognized interrogative word.
+function looksLikeQuestion(text: string): boolean {
+  if (text.trim().endsWith("?")) return true;
+  return /^(qué|que|cómo|como|cuándo|cuando|dónde|donde|por\s+qué|por\s+que|cuál|cual|quién|quien|what|how|when|where|why|which|who|is|are|does|can)\b/i.test(text.trim());
+}
+
 function detectFaq(html: string, doc: Doc): OpportunityResult {
   const BASE = { detector_id: "faq", label_es: "Preguntas frecuentes" };
   const pairs: QAPair[] = [];
 
-  // Details/summary — most reliable signal
+  // Details/summary — most reliable structural signal
   const details = doc.querySelectorAll("details");
   if (details.length > 0) {
     details.forEach((d: Doc, i: number) => {
@@ -106,21 +113,31 @@ function detectFaq(html: string, doc: Doc): OpportunityResult {
       const question = summary?.textContent?.trim() ?? "";
       const allText = d.textContent?.trim() ?? "";
       const answer = allText.replace(question, "").trim().slice(0, 400);
-      if (question && answer.length > 10) pairs.push({ question, answer });
+      if (question && answer.length > 10 && looksLikeQuestion(question)) {
+        pairs.push({ question, answer });
+      }
     });
   }
 
-  // FAQ class containers
+  // FAQ class containers — only when there's an explicit FAQ-named section
   if (pairs.length === 0) {
     const containers = [
       doc.querySelector(".faq"),
       doc.querySelector("#faq"),
       doc.querySelector(".faqs"),
       doc.querySelector("[class*='faq']"),
-      doc.querySelector("[class*='accordion']"),
       doc.querySelector(".preguntas"),
       doc.querySelector("#preguntas"),
+      // accordion only accepted when there is also a FAQ heading signal in the page
     ].filter(Boolean);
+
+    const hasFaqHeading = /preguntas\s+frecuentes|preguntas\s+y\s+respuestas|frequently\s+asked|\bfaq\b/i.test(html);
+
+    // Accept accordion containers only if the page has a real FAQ heading
+    if (hasFaqHeading && containers.length === 0) {
+      const acc = doc.querySelector("[class*='accordion']");
+      if (acc) containers.push(acc);
+    }
 
     const container = containers[0];
     if (container) {
@@ -129,7 +146,7 @@ function detectFaq(html: string, doc: Doc): OpportunityResult {
         if (i >= 15) return;
         const q = el.textContent?.trim() ?? "";
         if (!q || q.length < 10) return;
-        // Find answer: next sibling text or parent text minus question
+        if (!looksLikeQuestion(q)) return; // discard non-question text (e.g. "Ver testimonio")
         const parentText = el.parentElement?.textContent?.trim() ?? container.textContent?.trim() ?? "";
         const answer = parentText.replace(q, "").trim().slice(0, 400);
         if (answer.length > 20) pairs.push({ question: q, answer });
@@ -137,15 +154,18 @@ function detectFaq(html: string, doc: Doc): OpportunityResult {
     }
   }
 
+  // Require at least 2 valid Q&A pairs before claiming detected+actionable
+  const validPairs = pairs.filter(p => looksLikeQuestion(p.question));
+
   const hasFaqSignal = /preguntas\s+frecuentes|preguntas\s+y\s+respuestas|frequently\s+asked|\bfaq\b/i.test(html);
 
-  if (pairs.length > 0) {
+  if (validPairs.length >= 2) {
     return {
       ...BASE,
       status: "detected",
       actionable: true,
-      extracted_data: pairs.slice(0, 15),
-      suggestion_es: `${pairs.length} par${pairs.length !== 1 ? "es" : ""} de pregunta/respuesta detectado${pairs.length !== 1 ? "s" : ""}.`,
+      extracted_data: validPairs.slice(0, 15),
+      suggestion_es: `${validPairs.length} par${validPairs.length !== 1 ? "es" : ""} de pregunta/respuesta detectado${validPairs.length !== 1 ? "s" : ""}.`,
     };
   }
 
@@ -232,6 +252,13 @@ function detectReviewsUnmarked(html: string, doc: Doc, existingTypes: string[]):
           if (i >= 5 || snippets.length >= 5) return;
           const text = el.textContent?.trim() ?? "";
           if (text.length < 30) return;
+
+          // Cross-contamination guard: skip elements that look like FAQ items
+          // (their primary text content is a question, not a social proof statement)
+          const headingEl = el.querySelector("h3, h4, dt, strong, summary");
+          const headingText = headingEl?.textContent?.trim() ?? "";
+          if (looksLikeQuestion(headingText)) return;
+
           const authorEl = el.querySelector("cite") ?? el.querySelector("[class*='author']") ?? el.querySelector("[class*='name']");
           const author = authorEl?.textContent?.trim() || undefined;
           const starMatch = text.match(/★{1,5}|⭐{1,5}/);
