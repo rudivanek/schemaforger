@@ -73,6 +73,7 @@ interface Recommendation {
   linkLabel?: string;
   scrollToLlms?: boolean;
   scrollToSitemap?: boolean;
+  tldrProjectId?: string;
 }
 
 // detector_id → Schema.org type that gets added to @graph when opportunity is included
@@ -197,6 +198,7 @@ function buildRecommendations(
           text: `${opp.label_es} (${urlPath(proj.page_url)}): ${opp.suggestion_es}`,
           linkTo,
           linkLabel: 'Ver proyecto',
+          ...(opp.detector_id === 'tldr' ? { tldrProjectId: proj.id } : {}),
         });
       } else if (opp.status === 'detected' && opp.actionable) {
         const schemaType = OPPORTUNITY_SCHEMA_TYPE[opp.detector_id];
@@ -383,10 +385,36 @@ function RecommendationsSection({
   client: Client | null;
   display: AuditResult | null;
 }) {
+  const [tldrStates, setTldrStates] = useState<Record<string, { generating: boolean; suggestion: string; copied: boolean }>>({});
+
   const hasProjects = projects.length > 0;
   const recs = buildRecommendations(projects, template, client, display);
   const tier1 = recs.filter(r => r.tier === 1);
   const tier2 = recs.filter(r => r.tier === 2);
+
+  const handleGenerateTldr = async (projectId: string) => {
+    const proj = projects.find(p => p.id === projectId);
+    const scraped = proj?.raw_scraped_data as ScrapedData | null;
+    if (!scraped?.visible_text_sample) return;
+    setTldrStates(prev => ({ ...prev, [projectId]: { generating: true, suggestion: '', copied: false } }));
+    try {
+      const { data, error } = await supabase.functions.invoke('generate-tldr', {
+        body: { visible_text_sample: scraped.visible_text_sample, business_name: client?.name ?? '' },
+      });
+      if (error) throw error;
+      setTldrStates(prev => ({ ...prev, [projectId]: { generating: false, suggestion: data?.suggested_tldr ?? '', copied: false } }));
+    } catch {
+      setTldrStates(prev => ({ ...prev, [projectId]: { generating: false, suggestion: '', copied: false } }));
+    }
+  };
+
+  const handleCopyTldr = async (projectId: string) => {
+    const s = tldrStates[projectId]?.suggestion ?? '';
+    if (!s) return;
+    await navigator.clipboard.writeText(s);
+    setTldrStates(prev => ({ ...prev, [projectId]: { ...prev[projectId], copied: true } }));
+    setTimeout(() => setTldrStates(prev => ({ ...prev, [projectId]: { ...prev[projectId], copied: false } })), 2000);
+  };
 
   return (
     <div className="proof-card p-5 space-y-5">
@@ -464,6 +492,41 @@ function RecommendationsSection({
                       Ver sitemap abajo
                       <ArrowRight size={10} />
                     </button>
+                  )}
+                  {rec.tldrProjectId && (
+                    <div className="mt-2.5 space-y-2">
+                      <button
+                        onClick={() => handleGenerateTldr(rec.tldrProjectId!)}
+                        disabled={tldrStates[rec.tldrProjectId!]?.generating}
+                        className="btn-ghost text-xs flex items-center gap-1.5"
+                      >
+                        <Sparkles size={12} />
+                        {tldrStates[rec.tldrProjectId!]?.generating ? 'Generando...' : 'Generar sugerencia de TL;DR'}
+                      </button>
+                      {tldrStates[rec.tldrProjectId!]?.suggestion && (
+                        <div className="mt-1 space-y-2">
+                          <p className="text-[11px] font-mono font-bold text-amber-800 leading-relaxed">
+                            Este texto es para el contenido visible de la página (HTML/body) — NO se incluye en el schema JSON-LD. Un desarrollador debe agregarlo manualmente al inicio de la página.
+                          </p>
+                          <textarea
+                            value={tldrStates[rec.tldrProjectId!].suggestion}
+                            onChange={e => setTldrStates(prev => ({
+                              ...prev,
+                              [rec.tldrProjectId!]: { ...prev[rec.tldrProjectId!], suggestion: e.target.value },
+                            }))}
+                            rows={3}
+                            className="input-field w-full font-mono text-xs resize-none"
+                          />
+                          <button
+                            onClick={() => handleCopyTldr(rec.tldrProjectId!)}
+                            className="btn-ghost flex items-center gap-1.5 text-xs"
+                          >
+                            {tldrStates[rec.tldrProjectId!]?.copied ? <Check size={12} /> : <Copy size={12} />}
+                            {tldrStates[rec.tldrProjectId!]?.copied ? 'Copiado' : 'Copiar'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>

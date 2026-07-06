@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T22:00:00Z
+**Last Updated:** 2026-07-06T22:30:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -190,6 +190,8 @@ Returns `SitemapCheck`: `{ found, source, actual_sitemap_url, url_count, referen
 **Edge function `generate-tldr`**: Input `{ visible_text_sample, business_name }`. Calls Claude (`claude-sonnet-4-6`, max 256 tokens) with a strict system prompt: summarize in 2–3 sentences under 300 chars, same language as source, facts only from provided text. Returns `{ suggested_tldr }`.
 
 **ProjectWorkspace Step 1**: When `tldr` is `not_detected`, the amber advisory card shows a "Generar sugerencia de TL;DR" button (uses `Sparkles` icon). On click, calls `generate-tldr` with `visible_text_sample` + business name from scraped data. Result appears as an editable textarea. Above the textarea, in bold: "Este texto es para el contenido visible de la página (HTML/body) — NO se incluye en el schema JSON-LD. Un desarrollador debe agregarlo manualmente al inicio de la página." Copy button alongside.
+
+**GeoAuditPage — inline generation in Recomendaciones**: The `Recommendation` type gained a `tldrProjectId?: string` field. When `buildRecommendations` processes a `tldr` `not_detected` opportunity, it sets `tldrProjectId: proj.id`. `RecommendationsSection` now holds per-project TL;DR state (`Record<projectId, { generating, suggestion, copied }>`), a `handleGenerateTldr(projectId)` handler that calls the same `generate-tldr` edge function, and a `handleCopyTldr(projectId)` handler. The tier-1 card for that recommendation renders the "Generar sugerencia de TL;DR" button + result textarea + copy button inline — identical UI and boundary label as ProjectWorkspace. "Ver proyecto" link is kept alongside the generate button. State is keyed per project ID so multiple TL;DR cards on the same page operate independently.
 
 No "include in schema" checkbox exists or will be added for this detector.
 
