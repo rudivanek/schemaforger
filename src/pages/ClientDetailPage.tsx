@@ -2,7 +2,17 @@ import { useEffect, useState, useRef } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import type { Client, SchemaProject } from '../lib/database.types';
-import { ArrowLeft, Plus, X, AlertTriangle, AlertCircle, ExternalLink, Trash2 } from 'lucide-react';
+import { ArrowLeft, Plus, X, AlertTriangle, AlertCircle, ExternalLink, Trash2, Pencil } from 'lucide-react';
+
+const VERTICALS = [
+  { value: 'medical', label: 'Clínica / Consultorio Médico' },
+  { value: 'legal', label: 'Despacho Legal / Abogados' },
+  { value: 'restaurant', label: 'Restaurante / Café' },
+  { value: 'realestate', label: 'Inmobiliaria' },
+  { value: 'local', label: 'Negocio Local / Retail' },
+  { value: 'ecommerce', label: 'Tienda en Línea' },
+  { value: 'services', label: 'Servicios Profesionales' },
+];
 
 const STATUS_CHIP: Record<string, string> = {
   draft: 'chip-orange',
@@ -158,6 +168,12 @@ export default function ClientDetailPage() {
   const [deleteModal, setDeleteModal] = useState<DeleteModal | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // Edit client
+  const [editClientModal, setEditClientModal] = useState(false);
+  const [editForm, setEditForm] = useState({ name: '', website_url: '', vertical: 'medical' });
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState('');
+
   const loadData = async () => {
     if (!clientId) return;
     setLoading(true);
@@ -256,6 +272,36 @@ export default function ClientDetailPage() {
 
   const selectedProjects = projects.filter(p => selectedIds.has(p.id));
 
+  const openEditClientModal = () => {
+    if (!client) return;
+    setEditForm({ name: client.name, website_url: client.website_url, vertical: client.vertical });
+    setEditError('');
+    setEditClientModal(true);
+  };
+
+  const handleEditClientSave = async () => {
+    setEditError('');
+    if (!editForm.name.trim()) { setEditError('El nombre es requerido'); return; }
+    const trimmed = editForm.website_url.trim();
+    if (!trimmed) { setEditError('La URL es requerida'); return; }
+    if (/\s/.test(trimmed)) { setEditError('La URL no debe contener espacios'); return; }
+    const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    try { new URL(withProtocol); } catch {
+      setEditError('URL inválida — debe ser una dirección web válida (ej. https://ejemplo.com)');
+      return;
+    }
+    setEditSaving(true);
+    const { error } = await supabase.from('clients').update({
+      name: editForm.name.trim(),
+      website_url: withProtocol,
+      vertical: editForm.vertical,
+    }).eq('id', clientId!);
+    setEditSaving(false);
+    if (error) { setEditError(error.message); return; }
+    setEditClientModal(false);
+    loadData();
+  };
+
   return (
     <div className="max-w-4xl mx-auto">
       {/* Breadcrumb */}
@@ -285,6 +331,14 @@ export default function ClientDetailPage() {
               </a>
             </div>
             <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={openEditClientModal}
+                className="btn-ghost text-xs py-1 px-2 flex items-center gap-1.5"
+                title="Editar cliente"
+              >
+                <Pencil size={12} />
+                Editar
+              </button>
               <Link to={`/client/${client.id}/graph`} className="btn-ghost text-xs py-1 px-2">
                 Consolidado
               </Link>
@@ -574,6 +628,66 @@ export default function ClientDetailPage() {
                     : `Eliminar ${deleteModal.safe.length} proyecto${deleteModal.safe.length !== 1 ? 's' : ''}`}
                 </button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit client modal */}
+      {editClientModal && (
+        <div className="fixed inset-0 bg-ink/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white border border-rule rounded w-full max-w-md">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-rule">
+              <h2 className="font-semibold text-ink text-sm">Editar cliente</h2>
+              <button onClick={() => setEditClientModal(false)} className="text-ink-muted hover:text-ink">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div>
+                <label className="field-label">Nombre</label>
+                <input
+                  type="text"
+                  value={editForm.name}
+                  onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
+                  className="input-field w-full"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="field-label">Sitio web</label>
+                <input
+                  type="text"
+                  value={editForm.website_url}
+                  onChange={e => setEditForm(f => ({ ...f, website_url: e.target.value }))}
+                  className="input-field w-full font-mono"
+                  placeholder="https://ejemplo.com"
+                />
+                <p className="text-[10px] font-mono text-ink-muted mt-1">
+                  Si no incluyes https://, se añadirá automáticamente.
+                </p>
+              </div>
+              <div>
+                <label className="field-label">Vertical</label>
+                <select
+                  value={editForm.vertical}
+                  onChange={e => setEditForm(f => ({ ...f, vertical: e.target.value }))}
+                  className="input-field w-full"
+                >
+                  {VERTICALS.map(v => (
+                    <option key={v.value} value={v.value}>{v.label}</option>
+                  ))}
+                </select>
+              </div>
+              {editError && (
+                <p className="text-xs font-mono text-orange">{editError}</p>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 px-5 py-4 border-t border-rule">
+              <button onClick={() => setEditClientModal(false)} className="btn-ghost">Cancelar</button>
+              <button onClick={handleEditClientSave} disabled={editSaving} className="btn-primary">
+                {editSaving ? 'Guardando...' : 'Guardar cambios'}
+              </button>
             </div>
           </div>
         </div>

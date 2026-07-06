@@ -28,7 +28,14 @@ Deno.serve(async (req) => {
   try {
     const { site_url, business_data } = await req.json();
     if (!site_url) return json({ error: "site_url required" }, 400);
-    const origin = new URL(site_url).origin;
+    const rawUrl = String(site_url).trim();
+    const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+    let origin: string;
+    try {
+      origin = new URL(normalizedUrl).origin;
+    } catch {
+      return json({ error: "site_url debe ser una URL completa válida, p. ej. https://ejemplo.com" }, 400);
+    }
 
     // ---- robots.txt check ----
     let robotsFound = false;
