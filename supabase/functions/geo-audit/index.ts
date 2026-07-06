@@ -1,6 +1,7 @@
 // supabase/functions/geo-audit/index.ts
 // Checks whether AI crawlers can read the site (robots.txt) and whether llms.txt exists.
-// Optionally drafts an llms.txt from provided business data.
+// Optionally drafts an llms.txt from provided business data, and generates an improved
+// version of an existing llms.txt when checklist gaps are found.
 // Deploy: supabase functions deploy geo-audit
 
 const corsHeaders = {
@@ -8,28 +9,27 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// The AI crawlers that matter for GEO visibility
 const AI_CRAWLERS = [
-  "GPTBot",           // OpenAI training
-  "OAI-SearchBot",    // ChatGPT search
-  "ChatGPT-User",     // ChatGPT live browsing
-  "ClaudeBot",        // Anthropic
-  "Claude-Web",       // Claude browsing
-  "PerplexityBot",    // Perplexity
-  "Google-Extended",  // Gemini training
-  "Bingbot",          // Copilot answers
+  "GPTBot",
+  "OAI-SearchBot",
+  "ChatGPT-User",
+  "ClaudeBot",
+  "Claude-Web",
+  "PerplexityBot",
+  "Google-Extended",
+  "Bingbot",
   "Applebot-Extended",
   "cohere-ai",
 ];
 
-// Paths that are safe to disallow — admin/system, not real content
+// Paths safe to disallow — admin/system, never real content
 const NON_CONTENT_PATH = /^\/(wp-admin|wp-includes|wp-login|wp-json|cgi-bin|feed|feeds|trackback|admin|login|xmlrpc)(\/|$)|\.php(\/|\?|$)/i;
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    const { site_url, business_data } = await req.json();
+    const { site_url, business_data, page_urls } = await req.json();
     if (!site_url) return json({ error: "site_url required" }, 400);
     const rawUrl = String(site_url).trim();
     const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
@@ -51,14 +51,13 @@ Deno.serve(async (req) => {
         robotsRaw = await r.text();
         blockedCrawlers = findBlockedAiCrawlers(robotsRaw);
       }
-    } catch { /* network failure — leave robotsFound false */ }
+    } catch { /* network failure */ }
 
     // ---- llms.txt check ----
     let llmsFound = false;
     let llmsRaw: string | null = null;
     try {
       const l = await fetch(`${origin}/llms.txt`, { redirect: "follow" });
-      // Many hosts return a 200 HTML 404 page — verify it looks like markdown/text
       if (l.ok) {
         const body = await l.text();
         const looksLikeHtml = /<html|<!doctype/i.test(body.slice(0, 200));
@@ -66,14 +65,39 @@ Deno.serve(async (req) => {
       }
     } catch { /* leave false */ }
 
-    // ---- draft llms.txt if missing and business data provided ----
+    // ---- extract real business data from JSON-LD ----
+    const business = business_data ? extractFromJsonLd(business_data) : { services: [] } as BusinessData;
+    const pageUrlsList: string[] = Array.isArray(page_urls) ? page_urls : [];
+
+    // ---- draft llms.txt if missing ----
     const generatedLlmsTxt =
-      !llmsFound && business_data ? draftLlmsTxt(origin, business_data) : null;
+      !llmsFound ? draftLlmsTxt(origin, business, pageUrlsList) : null;
 
     // ---- qualitative analysis ----
     const robots_checklist = robotsFound ? analyzeRobotsTxt(robotsRaw) : null;
     const llmsContent = llmsRaw ?? generatedLlmsTxt ?? null;
     const llms_checklist = llmsContent ? analyzeLlmsTxt(llmsContent) : null;
+
+    // ---- sitemap probe → robots snippet (additive suggestion only) ----
+    let suggested_robots_snippet: string | null = null;
+    if (robotsFound && robots_checklist && !robots_checklist.has_sitemap) {
+      const sitemapUrl = await probeForSitemap(origin);
+      if (sitemapUrl) {
+        suggested_robots_snippet = `Sitemap: ${sitemapUrl}`;
+      }
+    }
+
+    // ---- improved llms.txt (existing file with gaps) ----
+    let improved_llms_txt: string | null = null;
+    if (llmsFound && llmsRaw && llms_checklist) {
+      const hasGaps = !llms_checklist.has_business_info
+        || llms_checklist.priority_page_count < 3
+        || !llms_checklist.has_contact
+        || !llms_checklist.has_services;
+      if (hasGaps) {
+        improved_llms_txt = buildImprovedLlmsTxt(llmsRaw, llms_checklist, business, pageUrlsList);
+      }
+    }
 
     return json({
       robots_txt_found: robotsFound,
@@ -85,15 +109,81 @@ Deno.serve(async (req) => {
       verdict: buildVerdict(robotsFound, blockedCrawlers, llmsFound),
       robots_checklist,
       llms_checklist,
+      suggested_robots_snippet,
+      improved_llms_txt,
     });
   } catch (e) {
     return json({ error: String(e) }, 500);
   }
 });
 
-// ── Parsers ───────────────────────────────────────────────────────────────────
+// ── Business data extraction ──────────────────────────────────────────────────
 
-// Parses robots.txt user-agent groups and reports AI crawlers hit by "Disallow: /"
+interface BusinessData {
+  name?: string;
+  description?: string;
+  telephone?: string;
+  email?: string;
+  address?: string;
+  services: string[];
+}
+
+function extractFromJsonLd(jsonld: unknown): BusinessData {
+  const result: BusinessData = { services: [] };
+  if (!jsonld || typeof jsonld !== "object") return result;
+
+  const jld = jsonld as Record<string, unknown>;
+  const nodes: unknown[] = Array.isArray(jld["@graph"])
+    ? (jld["@graph"] as unknown[])
+    : [jsonld];
+
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object") continue;
+    const node = raw as Record<string, unknown>;
+    const types = ([] as string[]).concat((node["@type"] as string | string[]) || []);
+
+    if (!result.name && typeof node.name === "string") result.name = node.name;
+    if (!result.description && typeof node.description === "string") result.description = node.description;
+    if (!result.telephone && typeof node.telephone === "string") result.telephone = node.telephone;
+    if (!result.email && typeof node.email === "string") result.email = node.email;
+    if (!result.address) {
+      if (typeof node.address === "string") {
+        result.address = node.address;
+      } else if (node.address && typeof node.address === "object") {
+        const addr = node.address as Record<string, unknown>;
+        if (typeof addr.streetAddress === "string") result.address = addr.streetAddress;
+      }
+    }
+    if (types.includes("Service") && typeof node.name === "string") {
+      const entry = typeof node.description === "string"
+        ? `${node.name} — ${node.description}`
+        : node.name;
+      result.services.push(entry);
+    }
+  }
+
+  return result;
+}
+
+// ── Sitemap probe ─────────────────────────────────────────────────────────────
+
+async function probeForSitemap(origin: string): Promise<string | null> {
+  const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
+  for (const url of candidates) {
+    try {
+      const r = await fetch(url, { redirect: "follow" });
+      if (!r.ok) continue;
+      const body = await r.text();
+      const looksLikeXml = body.trimStart().startsWith("<?xml") || /<urlset|<sitemapindex/i.test(body.slice(0, 500));
+      const looksLikeHtml = /<html|<!doctype/i.test(body.slice(0, 200));
+      if (looksLikeXml && !looksLikeHtml) return url;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+// ── Crawler analysis ──────────────────────────────────────────────────────────
+
 function findBlockedAiCrawlers(robots: string): string[] {
   const blocked = new Set<string>();
   const lines = robots.split(/\r?\n/).map((l) => l.trim());
@@ -124,8 +214,6 @@ function findBlockedAiCrawlers(robots: string): string[] {
       groupOpen = false;
     }
   }
-  // A specific "Allow" group for a crawler overrides the wildcard — simple heuristic:
-  // remove wildcard-blocked crawlers that have their own explicit group
   const explicitAgents = [...robots.matchAll(/user-agent:\s*(.+)/gi)].map((m) => m[1].trim().toLowerCase());
   return [...blocked].filter((b) => {
     if (!b.endsWith("(via wildcard *)")) return true;
@@ -147,7 +235,6 @@ function analyzeRobotsTxt(robots: string): RobotsChecklist {
   let sitemap_url: string | null = null;
   const unusual_disallows: string[] = [];
   const high_crawl_delay: { agent: string; delay: number }[] = [];
-
   let currentAgents: string[] = [];
   let groupOpen = false;
 
@@ -164,16 +251,13 @@ function analyzeRobotsTxt(robots: string): RobotsChecklist {
       groupOpen = false;
       continue;
     }
-
     if (key === "user-agent") {
       if (!groupOpen) currentAgents = [];
       currentAgents.push(value);
       groupOpen = true;
       continue;
     }
-
     if (key === "disallow") {
-      // Flag non-empty paths that aren't "/" (full block) and aren't admin/system
       if (value && value !== "/" && !NON_CONTENT_PATH.test(value)) {
         if (!unusual_disallows.includes(value)) unusual_disallows.push(value);
       }
@@ -181,9 +265,7 @@ function analyzeRobotsTxt(robots: string): RobotsChecklist {
     } else if (key === "crawl-delay") {
       const delay = parseFloat(value);
       if (!isNaN(delay) && delay > 5) {
-        for (const agent of currentAgents) {
-          high_crawl_delay.push({ agent, delay });
-        }
+        for (const agent of currentAgents) high_crawl_delay.push({ agent, delay });
       }
       groupOpen = false;
     } else {
@@ -191,12 +273,7 @@ function analyzeRobotsTxt(robots: string): RobotsChecklist {
     }
   }
 
-  return {
-    has_sitemap,
-    sitemap_url,
-    unusual_disallows: unusual_disallows.slice(0, 10),
-    high_crawl_delay,
-  };
+  return { has_sitemap, sitemap_url, unusual_disallows: unusual_disallows.slice(0, 10), high_crawl_delay };
 }
 
 interface LlmsChecklist {
@@ -208,15 +285,11 @@ interface LlmsChecklist {
 
 function analyzeLlmsTxt(text: string): LlmsChecklist {
   const lines = text.split("\n");
-
-  // Business info: top-level # heading + at least one blockquote (> ...) in first 10 lines
   const first10 = lines.slice(0, 10);
   const hasHeading = first10.some((l) => /^#\s+\S/.test(l));
   const hasBlockquote = first10.some((l) => /^>\s+\S/.test(l));
   const has_business_info = hasHeading && hasBlockquote;
 
-  // Priority pages: lines with markdown links under a "páginas / pages / priority" heading
-  // OR lines starting with "Priority:"
   let priority_page_count = 0;
   let inPrioritySection = false;
   for (const line of lines) {
@@ -229,52 +302,111 @@ function analyzeLlmsTxt(text: string): LlmsChecklist {
     if (inPrioritySection && /\[.+?\]\(https?:\/\/.+?\)/.test(line)) priority_page_count++;
   }
 
-  // Contact: email, phone-like pattern, or literal "contacto"/"contact" keyword
-  const has_contact =
-    /[\w.+%-]+@[\w-]+\.[a-z]{2,}|\+?\d[\d\s()./-]{7,}\d|contacto|contact/i.test(text);
+  const has_contact = /[\w.+%-]+@[\w-]+\.[a-z]{2,}|\+?\d[\d\s()./-]{7,}\d|contacto|contact/i.test(text);
 
-  // Services: a heading with "servicios"/"services" followed by at least one list item
   let has_services = false;
   let inServicesSection = false;
   for (const line of lines) {
-    if (/^#{1,2}\s+(servicios|services)/i.test(line)) {
-      inServicesSection = true;
-      continue;
-    }
+    if (/^#{1,2}\s+(servicios|services)/i.test(line)) { inServicesSection = true; continue; }
     if (/^#{1,2}\s+/.test(line)) inServicesSection = false;
-    if (inServicesSection && /^[-*]\s+\S/.test(line)) {
-      has_services = true;
-      break;
-    }
+    if (inServicesSection && /^[-*]\s+\S/.test(line)) { has_services = true; break; }
   }
 
   return { has_business_info, priority_page_count, has_contact, has_services };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── llms.txt generators ───────────────────────────────────────────────────────
 
-function draftLlmsTxt(origin: string, d: {
-  name?: string; description?: string; services?: string[];
-  phone?: string; address?: string; key_pages?: { title: string; url: string; note?: string }[];
-}): string {
+// From-scratch draft (no llms.txt exists). Uses real data where available, bracketed
+// placeholders where the schema didn't supply the field.
+function draftLlmsTxt(origin: string, business: BusinessData, pageUrls: string[]): string {
   const lines: string[] = [];
-  lines.push(`# ${d.name ?? origin}`);
-  if (d.description) lines.push(`\n> ${d.description}`);
-  if (d.address || d.phone) {
+  lines.push(`# ${business.name ?? origin}`);
+
+  const desc = business.description
+    ?? "[Agrega aquí una descripción breve de tu negocio]";
+  lines.push(`\n> ${desc}`);
+
+  if (business.telephone || business.email || business.address) {
     lines.push(`\n## Contacto`);
-    if (d.address) lines.push(`- Dirección: ${d.address}`);
-    if (d.phone) lines.push(`- Teléfono: ${d.phone}`);
+    if (business.address) lines.push(`- Dirección: ${business.address}`);
+    if (business.telephone) lines.push(`- Teléfono: ${business.telephone}`);
+    if (business.email) lines.push(`- Email: ${business.email}`);
+  } else {
+    lines.push(`\n## Contacto\n- [Agrega tu teléfono y correo aquí]`);
   }
-  if (d.services?.length) {
+
+  if (business.services.length > 0) {
     lines.push(`\n## Servicios`);
-    d.services.forEach((s) => lines.push(`- ${s}`));
+    business.services.forEach((s) => lines.push(`- ${s}`));
+  } else {
+    lines.push(`\n## Servicios\n- [Agrega aquí una lista de tus servicios principales]`);
   }
-  if (d.key_pages?.length) {
+
+  if (pageUrls.length > 0) {
     lines.push(`\n## Páginas principales`);
-    d.key_pages.forEach((p) => lines.push(`- [${p.title}](${p.url})${p.note ? `: ${p.note}` : ""}`));
+    pageUrls.slice(0, 5).forEach((url) => lines.push(`- [${url}](${url})`));
+  } else {
+    lines.push(`\n## Páginas principales\n- [Agrega aquí tus páginas más importantes]`);
   }
+
   return lines.join("\n") + "\n";
 }
+
+// Improved version of an existing llms.txt — starts from existing content, only appends
+// missing sections. Uses real data; falls back to bracketed placeholders.
+function buildImprovedLlmsTxt(
+  existing: string,
+  checklist: LlmsChecklist,
+  business: BusinessData,
+  pageUrls: string[],
+): string {
+  let content = existing.trimEnd();
+
+  if (!checklist.has_business_info) {
+    const desc = business.description
+      ?? "[Agrega aquí una descripción breve de tu negocio — no se encontró una en el schema generado]";
+    // Try to insert a blockquote right after the first top-level heading
+    if (/^#\s+\S/m.test(content)) {
+      content = content.replace(/^(#\s+.+)$/m, `$1\n\n> ${desc}`);
+    } else {
+      // No heading found at all — prepend business info
+      content = `> ${desc}\n\n` + content;
+    }
+    // Collapse triple+ newlines introduced by the replacement
+    content = content.replace(/\n{3,}/g, "\n\n");
+  }
+
+  if (checklist.priority_page_count < 3) {
+    const needed = 3 - checklist.priority_page_count;
+    const missing = pageUrls.filter((url) => !content.includes(url)).slice(0, needed);
+    if (missing.length > 0) {
+      content += "\n\n## Páginas principales\n" + missing.map((u) => `- [${u}](${u})`).join("\n");
+    }
+  }
+
+  if (!checklist.has_contact) {
+    if (business.telephone || business.email) {
+      content += "\n\n## Contacto";
+      if (business.telephone) content += `\n- Teléfono: ${business.telephone}`;
+      if (business.email) content += `\n- Email: ${business.email}`;
+    } else {
+      content += "\n\n## Contacto\n- [Agrega tu teléfono y correo aquí]";
+    }
+  }
+
+  if (!checklist.has_services) {
+    if (business.services.length > 0) {
+      content += "\n\n## Servicios\n" + business.services.map((s) => `- ${s}`).join("\n");
+    } else {
+      content += "\n\n## Servicios\n- [Agrega aquí una lista de tus servicios principales]";
+    }
+  }
+
+  return content + "\n";
+}
+
+// ── Verdict ───────────────────────────────────────────────────────────────────
 
 function buildVerdict(robotsFound: boolean, blocked: string[], llmsFound: boolean): string {
   const parts: string[] = [];

@@ -5,7 +5,7 @@ import type { Client, GeoAudit, SchemaProject, SchemaTemplate } from '../lib/dat
 import {
   ArrowLeft, Bot, FileText, Shield, ShieldOff, Copy, Check,
   AlertTriangle, CheckCircle, RefreshCw, Save, Zap, Lightbulb, Info, ArrowRight,
-  XCircle,
+  XCircle, ChevronDown, ChevronRight, Sparkles,
 } from 'lucide-react';
 
 const AI_CRAWLERS = ['GPTBot', 'ClaudeBot', 'PerplexityBot', 'Googlebot-Extended', 'CCBot', 'anthropic-ai', 'cohere-ai', 'FacebookBot'];
@@ -36,6 +36,8 @@ interface AuditResult {
   verdict: string;
   robots_checklist?: RobotsChecklist | null;
   llms_checklist?: LlmsChecklist | null;
+  suggested_robots_snippet?: string | null;
+  improved_llms_txt?: string | null;
 }
 
 interface OpportunityResult {
@@ -472,8 +474,12 @@ export default function GeoAuditPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [robotsExpanded, setRobotsExpanded] = useState(false);
+  const [snippetCopied, setSnippetCopied] = useState(false);
   const [llmsText, setLlmsText] = useState('');
   const [llmsCopied, setLlmsCopied] = useState(false);
+  const [improvedLlmsText, setImprovedLlmsText] = useState('');
+  const [improvedExpanded, setImprovedExpanded] = useState(false);
+  const [improvedCopied, setImprovedCopied] = useState(false);
 
   useEffect(() => {
     loadData();
@@ -521,24 +527,18 @@ export default function GeoAuditPage() {
     setAuditError('');
     setAuditing(true);
     try {
-      const { data: proj } = await supabase
-        .from('schema_projects')
-        .select('generated_jsonld')
-        .eq('client_id', clientId!)
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
       const { data, error } = await supabase.functions.invoke('geo-audit', {
         body: {
           site_url: client.website_url,
-          business_data: proj?.generated_jsonld ?? undefined,
+          business_data: projects[0]?.generated_jsonld ?? undefined,
+          page_urls: projects.map(p => p.page_url),
         },
       });
       if (error) throw error;
       if (!data) throw new Error('Sin respuesta del servidor');
       setResult(data as AuditResult);
       if (data.generated_llms_txt) setLlmsText(data.generated_llms_txt);
+      if (data.improved_llms_txt) { setImprovedLlmsText(data.improved_llms_txt); setImprovedExpanded(false); }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Error al auditar';
       setAuditError(msg);
@@ -571,6 +571,18 @@ export default function GeoAuditPage() {
     await navigator.clipboard.writeText(llmsText);
     setLlmsCopied(true);
     setTimeout(() => setLlmsCopied(false), 2000);
+  };
+
+  const handleCopySnippet = async (text: string) => {
+    await navigator.clipboard.writeText(text);
+    setSnippetCopied(true);
+    setTimeout(() => setSnippetCopied(false), 2000);
+  };
+
+  const handleCopyImproved = async () => {
+    await navigator.clipboard.writeText(improvedLlmsText);
+    setImprovedCopied(true);
+    setTimeout(() => setImprovedCopied(false), 2000);
   };
 
   const display = result ?? (lastAudit ? {
@@ -728,6 +740,32 @@ export default function GeoAuditPage() {
                 )}
               </div>
             )}
+
+            {/* Suggested additive snippet — only when Sitemap directive is missing */}
+            {display.suggested_robots_snippet && (
+              <div className="mt-4 pt-4 border-t border-rule">
+                <div className="flex items-start gap-2 mb-2">
+                  <Sparkles size={12} className="text-blue shrink-0 mt-0.5" />
+                  <p className="text-[11px] font-mono text-blue font-medium">
+                    Línea sugerida para agregar a tu robots.txt existente (no reemplaces el archivo completo):
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 bg-proof border border-rule rounded px-3 py-2">
+                  <code className="flex-1 text-xs font-mono text-ink">{display.suggested_robots_snippet}</code>
+                  <button
+                    onClick={() => handleCopySnippet(display.suggested_robots_snippet!)}
+                    className="btn-ghost flex items-center gap-1 text-[11px] shrink-0"
+                  >
+                    {snippetCopied ? <Check size={11} /> : <Copy size={11} />}
+                    {snippetCopied ? 'Copiado' : 'Copiar'}
+                  </button>
+                </div>
+                <p className="text-[10px] font-mono text-ink-muted mt-1.5">
+                  Agrega esta línea al final de tu archivo robots.txt actual. No es necesario modificar ninguna otra línea existente.
+                </p>
+              </div>
+            )}
+
           </div>
 
           {/* llms.txt */}
@@ -794,6 +832,52 @@ export default function GeoAuditPage() {
               <p className="mt-3 text-[11px] font-mono text-ink-muted">
                 Ejecuta una nueva auditoría para ver el análisis detallado de este archivo.
               </p>
+            )}
+
+            {/* Improved llms.txt — collapsible, only when existing file has gaps */}
+            {display.llms_txt_found && improvedLlmsText && (
+              <div className="mt-4 pt-4 border-t border-rule">
+                <button
+                  onClick={() => setImprovedExpanded(v => !v)}
+                  className="flex items-center gap-2 w-full text-left group"
+                >
+                  <Sparkles size={12} className="text-blue shrink-0" />
+                  <span className="text-[11px] font-mono font-medium text-blue flex-1">
+                    Versión mejorada sugerida (copiar y pegar)
+                  </span>
+                  {improvedExpanded
+                    ? <ChevronDown size={12} className="text-ink-muted shrink-0" />
+                    : <ChevronRight size={12} className="text-ink-muted shrink-0" />}
+                </button>
+
+                {improvedExpanded && (
+                  <div className="mt-3 space-y-2">
+                    <textarea
+                      value={improvedLlmsText}
+                      onChange={e => setImprovedLlmsText(e.target.value)}
+                      rows={12}
+                      className="input-field w-full font-mono text-xs resize-none"
+                    />
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <p className="text-[10px] font-mono text-ink-muted">
+                          Reemplaza el contenido de tu archivo /llms.txt actual con esta versión.
+                        </p>
+                        <p className="text-[10px] font-mono text-amber-600">
+                          Los textos entre corchetes [ ] son marcadores — completa o elimínalos antes de publicar.
+                        </p>
+                      </div>
+                      <button
+                        onClick={handleCopyImproved}
+                        className="btn-ghost flex items-center gap-1.5 text-xs shrink-0"
+                      >
+                        {improvedCopied ? <Check size={12} /> : <Copy size={12} />}
+                        {improvedCopied ? 'Copiado' : 'Copiar'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
           </div>
 

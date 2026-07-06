@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T18:00:00Z
+**Last Updated:** 2026-07-06T20:00:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -100,6 +100,41 @@ The UI shows a **"Cómo está ahora / Cómo debería estar"** checklist panel in
 - **< 3 priority pages in llms.txt** → "Tu llms.txt tiene solo N página(s) prioritaria(s)…"
 - **No contact info in llms.txt** → "Agrega información de contacto (teléfono, email) a tu llms.txt…"
 - **No services section in llms.txt** → "Agrega una lista de tus servicios principales…"
+
+### 4d. Suggested robots.txt Snippet (additive only)
+
+After `analyzeRobotsTxt()`, if `!has_sitemap`, the function calls `probeForSitemap(origin)` which tries `/sitemap.xml` then `/sitemap_index.xml` (verifies non-HTML XML response). If a real sitemap is found:
+
+- Returns `suggested_robots_snippet: "Sitemap: {url}"` — a single-line string only.
+- Returns `null` if the sitemap directive already exists, or no working sitemap was found at all.
+
+**UI**: Inside the robots.txt card, a small highlighted box with the snippet in monospace, a one-click Copy button, and the instruction "Agrega esta línea al final de tu archivo robots.txt actual. No es necesario modificar ninguna otra línea existente." Never a full file replacement, never suggestions for Disallow or Crawl-delay findings (those stay as review-only amber notes).
+
+### 4e. Improved llms.txt (existing file with gaps)
+
+When `llms_txt_found` is true AND `llms_checklist` shows at least one false item, the edge function calls `buildImprovedLlmsTxt()`:
+
+1. **Starts from `llms_txt_raw`** — never discards existing content.
+2. Extracts real business data from `generated_jsonld` via `extractFromJsonLd()` (walks `@graph` nodes, pulls `name`, `description`, `telephone`, `email`, `address`, `Service` items).
+3. For each gap, **appends** a new section using real data. Falls back to bracketed placeholders (`[ ]`) when the schema didn't supply the field — never fabricated text.
+4. Returns `improved_llms_txt: string` in the response (null if no gaps).
+
+| Gap | Action |
+|---|---|
+| No business info (heading+blockquote) | Insert `> {description}` after first `#` heading |
+| < 3 priority pages | Append `## Páginas principales` with real project URLs not already listed |
+| No contact info | Append `## Contacto` with real telephone/email from schema |
+| No services section | Append `## Servicios` with real Service node names from schema |
+
+**UI**: A collapsible "Versión mejorada sugerida (copiar y pegar)" section below the checklist in the llms.txt card — collapsed by default. Contains an editable textarea pre-filled with the improved content, a Copy button, the instruction to replace the live file, and a note: "Los textos entre corchetes [ ] son marcadores — completa o elimínalos antes de publicar."
+
+### 4f. From-scratch draft (no llms.txt) — same real-data standard
+
+`draftLlmsTxt()` now uses the same `extractFromJsonLd()` approach and the same bracketed-placeholder convention for missing fields. The `page_urls` array (all validated/delivered project URLs) is passed from the client and used for the `## Páginas principales` section. No invented text anywhere.
+
+### 4g. Data flow change
+
+`handleAudit` in `GeoAuditPage` no longer makes a separate Supabase query for `generated_jsonld`. Instead it reads from the `projects` state already in memory, passing both the latest `generated_jsonld` and all `page_urls` in the edge function request body.
 
 ### 4d. Storage
 
