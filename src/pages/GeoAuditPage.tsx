@@ -594,7 +594,9 @@ export default function GeoAuditPage() {
           Clientes
         </button>
         <span>/</span>
-        <span className="text-ink">{client?.name ?? '...'}</span>
+        <button onClick={() => navigate(`/client/${clientId}`)} className="hover:text-ink text-ink">
+          {client?.name ?? '...'}
+        </button>
         <span>/</span>
         <span>GEO Audit</span>
       </div>
