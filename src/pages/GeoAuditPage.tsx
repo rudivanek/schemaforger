@@ -379,11 +379,13 @@ function RecommendationsSection({
   template,
   client,
   display,
+  draftProjects,
 }: {
   projects: SchemaProject[];
   template: SchemaTemplate | null;
   client: Client | null;
   display: AuditResult | null;
+  draftProjects: Array<{ id: string; page_url: string; client_id: string }>;
 }) {
   const [tldrStates, setTldrStates] = useState<Record<string, { generating: boolean; suggestion: string; copied: boolean }>>({});
 
@@ -428,6 +430,30 @@ function RecommendationsSection({
           Estas recomendaciones mejoran las probabilidades de visibilidad en herramientas de IA — no garantizan que un asistente de IA cite o recomiende el negocio.
         </p>
       </div>
+
+      {/* Draft projects excluded note */}
+      {draftProjects.length > 0 && (
+        <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded p-3">
+          <Info size={13} className="text-amber-600 shrink-0 mt-0.5" />
+          <div className="min-w-0">
+            <p className="text-xs font-mono text-amber-700">
+              {draftProjects.length} proyecto{draftProjects.length !== 1 ? 's' : ''} en borrador no incluido{draftProjects.length !== 1 ? 's' : ''} en este análisis — valida su schema en el paso 3 para que aparezcan aquí.
+            </p>
+            <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1.5">
+              {draftProjects.map(p => (
+                <Link
+                  key={p.id}
+                  to={`/client/${p.client_id}/project/${p.id}`}
+                  className="text-[11px] font-mono text-amber-700 hover:underline inline-flex items-center gap-1"
+                >
+                  {urlPath(p.page_url)} (borrador)
+                  <ArrowRight size={9} />
+                </Link>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* No projects yet */}
       {!hasProjects && (
@@ -593,6 +619,7 @@ export default function GeoAuditPage() {
   const [client, setClient] = useState<Client | null>(null);
   const [lastAudit, setLastAudit] = useState<GeoAudit | null>(null);
   const [projects, setProjects] = useState<SchemaProject[]>([]);
+  const [draftProjects, setDraftProjects] = useState<Array<{ id: string; page_url: string; client_id: string }>>([]);
   const [template, setTemplate] = useState<SchemaTemplate | null>(null);
   const [result, setResult] = useState<AuditResult | null>(null);
   const [auditing, setAuditing] = useState(false);
@@ -616,7 +643,7 @@ export default function GeoAuditPage() {
     const { data: c } = await supabase.from('clients').select('*').eq('id', clientId).maybeSingle();
     if (c) setClient(c);
 
-    const [auditRes, projectsRes] = await Promise.all([
+    const [auditRes, projectsRes, draftRes] = await Promise.all([
       supabase
         .from('geo_audits')
         .select('*')
@@ -630,6 +657,12 @@ export default function GeoAuditPage() {
         .eq('client_id', clientId)
         .in('status', ['validated', 'delivered'])
         .order('updated_at', { ascending: false }),
+      supabase
+        .from('schema_projects')
+        .select('id, page_url, client_id')
+        .eq('client_id', clientId)
+        .eq('status', 'draft')
+        .order('updated_at', { ascending: false }),
     ]);
 
     if (auditRes.data) {
@@ -637,6 +670,7 @@ export default function GeoAuditPage() {
       if (auditRes.data.generated_llms_txt) setLlmsText(auditRes.data.generated_llms_txt);
     }
     if (projectsRes.data) setProjects(projectsRes.data as SchemaProject[]);
+    if (draftRes.data) setDraftProjects(draftRes.data as Array<{ id: string; page_url: string; client_id: string }>);
 
     if (c?.vertical) {
       const { data: tmpl } = await supabase
@@ -1094,6 +1128,7 @@ export default function GeoAuditPage() {
             template={template}
             client={client}
             display={display}
+            draftProjects={draftProjects}
           />
 
           {result && (
@@ -1124,12 +1159,13 @@ export default function GeoAuditPage() {
           </div>
 
           {/* Show recommendations even without a fresh audit if we have projects */}
-          {projects.length > 0 && (
+          {(projects.length > 0 || draftProjects.length > 0) && (
             <RecommendationsSection
               projects={projects}
               template={template}
               client={client}
               display={null}
+              draftProjects={draftProjects}
             />
           )}
         </div>

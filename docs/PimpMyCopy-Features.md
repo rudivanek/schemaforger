@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T22:30:00Z
+**Last Updated:** 2026-07-06T23:00:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -194,6 +194,10 @@ Returns `SitemapCheck`: `{ found, source, actual_sitemap_url, url_count, referen
 **GeoAuditPage — inline generation in Recomendaciones**: The `Recommendation` type gained a `tldrProjectId?: string` field. When `buildRecommendations` processes a `tldr` `not_detected` opportunity, it sets `tldrProjectId: proj.id`. `RecommendationsSection` now holds per-project TL;DR state (`Record<projectId, { generating, suggestion, copied }>`), a `handleGenerateTldr(projectId)` handler that calls the same `generate-tldr` edge function, and a `handleCopyTldr(projectId)` handler. The tier-1 card for that recommendation renders the "Generar sugerencia de TL;DR" button + result textarea + copy button inline — identical UI and boundary label as ProjectWorkspace. "Ver proyecto" link is kept alongside the generate button. State is keyed per project ID so multiple TL;DR cards on the same page operate independently.
 
 No "include in schema" checkbox exists or will be added for this detector.
+
+### 4k. Draft Projects Excluded Note (GeoAuditPage)
+
+`GeoAuditPage.loadData` now runs a third parallel query — lightweight (`id, page_url, client_id`), filtered to `status = 'draft'` — stored in `draftProjects` state. `RecommendationsSection` received a new `draftProjects` prop. When `draftProjects.length > 0`, an amber info banner appears at the top of the "Recomendaciones priorizadas" card: _"N proyecto(s) en borrador no incluidos en este análisis — valida su schema en el paso 3 para que aparezcan aquí."_ Each draft project's page URL is listed as a direct link (with arrow icon) to its workspace. When `draftProjects.length === 0`, nothing extra renders. The no-audit fallback that shows recommendations without a live audit result was also widened from `projects.length > 0` to `projects.length > 0 || draftProjects.length > 0`, so the note is visible even on clients with only draft projects.
 
 ### 4d. Storage
 
