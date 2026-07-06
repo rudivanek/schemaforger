@@ -246,6 +246,11 @@ export default function ProjectWorkspace() {
   const dupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [includedOpportunities, setIncludedOpportunities] = useState<string[]>([]);
 
+  // TL;DR copy suggestion — separate from schema/JSON-LD pipeline
+  const [tldrGenerating, setTldrGenerating] = useState(false);
+  const [tldrSuggestion, setTldrSuggestion] = useState('');
+  const [tldrCopied, setTldrCopied] = useState(false);
+
   // Secondary-page entity reference
   const [mainEntity, setMainEntity] = useState<{ id: string; type: string; name: string } | null>(null);
   const [homepageProjectMissing, setHomepageProjectMissing] = useState(false);
@@ -576,9 +581,28 @@ export default function ProjectWorkspace() {
   };
 
   const handleDeliver = async () => {
-    setDelivering(true);
     await persistProject({ status: 'delivered' });
     setDelivering(false);
+  };
+
+  const handleGenerateTldr = async () => {
+    if (!scraped?.visible_text_sample) return;
+    setTldrGenerating(true);
+    try {
+      const businessName = scraped.og_site_name ?? scraped.title ?? client?.name ?? '';
+      const { data, error } = await supabase.functions.invoke('generate-tldr', {
+        body: { visible_text_sample: scraped.visible_text_sample, business_name: businessName },
+      });
+      if (error) throw error;
+      if (data?.suggested_tldr) setTldrSuggestion(data.suggested_tldr);
+    } catch { /* leave empty */ }
+    setTldrGenerating(false);
+  };
+
+  const handleCopyTldr = async () => {
+    await navigator.clipboard.writeText(tldrSuggestion);
+    setTldrCopied(true);
+    setTimeout(() => setTldrCopied(false), 2000);
   };
 
   const getRequiredFields = (schemaType: string): string[] => {
@@ -839,13 +863,45 @@ export default function ProjectWorkspace() {
                 <div className="space-y-2">
                   {scraped.opportunities.map(opp => {
                     if (opp.status === 'not_detected') {
-                      // breadcrumb/faq — always show advisory
+                      // breadcrumb/faq/tldr — always show advisory
                       return (
                         <div key={opp.detector_id} className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded p-3">
                           <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
-                          <div>
+                          <div className="flex-1 min-w-0">
                             <p className="text-xs font-mono font-semibold text-amber-700">{opp.label_es} — no detectado</p>
                             <p className="text-[11px] font-mono text-amber-600 mt-0.5 leading-relaxed">{opp.suggestion_es}</p>
+                            {opp.detector_id === 'tldr' && (
+                              <div className="mt-2.5 space-y-2">
+                                <button
+                                  onClick={handleGenerateTldr}
+                                  disabled={tldrGenerating}
+                                  className="btn-ghost text-xs flex items-center gap-1.5 text-amber-700 border-amber-300 hover:bg-amber-100"
+                                >
+                                  <Sparkles size={12} />
+                                  {tldrGenerating ? 'Generando...' : 'Generar sugerencia de TL;DR'}
+                                </button>
+                                {tldrSuggestion && (
+                                  <div className="mt-2 space-y-2">
+                                    <p className="text-[11px] font-mono font-bold text-amber-800 leading-relaxed">
+                                      Este texto es para el contenido visible de la página (HTML/body) — NO se incluye en el schema JSON-LD. Un desarrollador debe agregarlo manualmente al inicio de la página.
+                                    </p>
+                                    <textarea
+                                      value={tldrSuggestion}
+                                      onChange={e => setTldrSuggestion(e.target.value)}
+                                      rows={3}
+                                      className="input-field w-full font-mono text-xs resize-none"
+                                    />
+                                    <button
+                                      onClick={handleCopyTldr}
+                                      className="btn-ghost flex items-center gap-1.5 text-xs"
+                                    >
+                                      {tldrCopied ? <Check size={12} /> : <Copy size={12} />}
+                                      {tldrCopied ? 'Copiado' : 'Copiar'}
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
                         </div>
                       );

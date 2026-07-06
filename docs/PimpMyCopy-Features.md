@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T21:30:00Z
+**Last Updated:** 2026-07-06T22:00:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -176,6 +176,22 @@ Returns `SitemapCheck`: `{ found, source, actual_sitemap_url, url_count, referen
 | no match | `null` — no note shown |
 
 **GeoAuditPage**: Per-path rendering in the "Rutas bloqueadas" section — each flagged path gets its own chip, and if `note` is non-null, a small italic line appears directly below that chip. Paths without a matched note show no extra text. The overall framing ("confirma que no ocultan contenido indexable") remains as section header. No fix/edit buttons — advisory only.
+
+### 4j. TL;DR / Summary Suggestion (visible copy, not schema)
+
+**Boundary:** This feature writes nothing to `schema_projects.generated_jsonld`. Output is page body copy only.
+
+**Detector `tldr`** (scrape-site): Added to `ALWAYS_ADVISE`. Checks in order:
+1. Explicit container with class/id matching `summary`, `tldr`, `resumen`
+2. Heuristic: first `<p>` < 300 chars followed by a `<p>` ≥ 300 chars
+
+`detected` → non-actionable info card (no checkbox). `not_detected` → amber advisory card.
+
+**Edge function `generate-tldr`**: Input `{ visible_text_sample, business_name }`. Calls Claude (`claude-sonnet-4-6`, max 256 tokens) with a strict system prompt: summarize in 2–3 sentences under 300 chars, same language as source, facts only from provided text. Returns `{ suggested_tldr }`.
+
+**ProjectWorkspace Step 1**: When `tldr` is `not_detected`, the amber advisory card shows a "Generar sugerencia de TL;DR" button (uses `Sparkles` icon). On click, calls `generate-tldr` with `visible_text_sample` + business name from scraped data. Result appears as an editable textarea. Above the textarea, in bold: "Este texto es para el contenido visible de la página (HTML/body) — NO se incluye en el schema JSON-LD. Un desarrollador debe agregarlo manualmente al inicio de la página." Copy button alongside.
+
+No "include in schema" checkbox exists or will be added for this detector.
 
 ### 4d. Storage
 

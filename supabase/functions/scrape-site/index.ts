@@ -352,6 +352,58 @@ function detectHowTo(html: string, doc: Doc): OpportunityResult {
 
 interface JobData { title: string; description?: string; }
 
+function detectTldr(_html: string, doc: Doc): OpportunityResult {
+  const BASE = { detector_id: "tldr", label_es: "Resumen / TL;DR" };
+
+  // Explicit summary/tldr/resumen containers
+  const candidates = [
+    doc.querySelector('[class*="summary"]'),
+    doc.querySelector('[id*="summary"]'),
+    doc.querySelector('[class*="tldr"]'),
+    doc.querySelector('[id*="tldr"]'),
+    doc.querySelector('[class*="resumen"]'),
+    doc.querySelector('[id*="resumen"]'),
+  ].filter(Boolean);
+
+  for (const el of candidates) {
+    const text = el.textContent?.trim() ?? "";
+    if (text.length > 20 && text.length < 400) {
+      return {
+        ...BASE,
+        status: "detected",
+        actionable: false,
+        extracted_data: { text: text.slice(0, 300) },
+        suggestion_es: "Se detectó un bloque de resumen/TL;DR al inicio del contenido.",
+      };
+    }
+  }
+
+  // Heuristic: first paragraph is short + precedes longer paragraphs
+  const paras: string[] = [];
+  doc.querySelectorAll("p").forEach((p: Doc) => {
+    const t = p.textContent?.trim() ?? "";
+    if (t.length > 20) paras.push(t);
+  });
+
+  if (paras.length >= 2 && paras[0].length < 300 && paras[1].length >= 300) {
+    return {
+      ...BASE,
+      status: "detected",
+      actionable: false,
+      extracted_data: { text: paras[0] },
+      suggestion_es: "Se detectó un párrafo introductorio breve que funciona como resumen.",
+    };
+  }
+
+  return {
+    ...BASE,
+    status: "not_detected",
+    actionable: false,
+    extracted_data: null,
+    suggestion_es: "No se detectó un resumen breve (TL;DR) al inicio del contenido. Un resumen corto y directo ayuda a que las herramientas de IA extraigan y citen la información clave más fácilmente.",
+  };
+}
+
 function detectJobPosting(html: string, doc: Doc): OpportunityResult {
   const BASE = { detector_id: "jobposting", label_es: "Vacantes" };
 
@@ -395,7 +447,7 @@ function detectJobPosting(html: string, doc: Doc): OpportunityResult {
 
 // "always_advise" detectors emit advisory cards even when not_detected.
 // All others are silent when not_detected.
-const ALWAYS_ADVISE = new Set(["breadcrumb", "faq"]);
+const ALWAYS_ADVISE = new Set(["breadcrumb", "faq", "tldr"]);
 
 interface DetectorEntry {
   run: (html: string, doc: Doc, meta: { existingTypes: string[] }) => OpportunityResult;
@@ -404,6 +456,7 @@ interface DetectorEntry {
 const DETECTORS: DetectorEntry[] = [
   { run: (html, doc) => detectBreadcrumb(html, doc) },
   { run: (html, doc) => detectFaq(html, doc) },
+  { run: (html, doc) => detectTldr(html, doc) },
   { run: (html, doc) => detectVideo(html, doc) },
   { run: (html, doc, { existingTypes }) => detectReviewsUnmarked(html, doc, existingTypes) },
   { run: (html, doc) => detectHowTo(html, doc) },
