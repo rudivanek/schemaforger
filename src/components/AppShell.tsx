@@ -19,7 +19,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <header className="bg-white border-b border-rule h-12 flex items-center px-4 shrink-0">
         <div className="flex items-center gap-2 mr-8">
           <Layers size={16} className="text-orange" />
-          <span className="font-mono text-xs tracking-widest uppercase text-ink font-semibold"><span className="text-[10px] font-normal normal-case tracking-normal opacity-50 mr-1.5">v1.1</span>SchemaForge</span>
+          <span className="font-mono text-xs tracking-widest uppercase text-ink font-semibold"><span className="text-[10px] font-normal normal-case tracking-normal opacity-50 mr-1.5">v1.2</span>SchemaForge</span>
         </div>
         <nav className="flex items-center gap-1 flex-1">
           <Link
