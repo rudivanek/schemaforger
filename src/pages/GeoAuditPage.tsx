@@ -209,10 +209,12 @@ function buildRecommendations(
     const scraped = proj.raw_scraped_data as ScrapedData | null;
     if (!scraped?.visible_text_sample) continue;
     const sample = scraped.visible_text_sample;
-    const hasNumbers = /\b\d{2,}\b/.test(sample);
+    const hasCredibilityNumber =
+      /\b\d{1,4}\+?\s*(años|year|clientes|proyectos|pacientes|patients|clients|projects)\b/i.test(sample) ||
+      /\b(más de|over)\s*\d{1,4}\b/i.test(sample);
     const hasCredentials =
       /(años de experiencia|certificad|acreditad|graduad|egresad|licenciatura|maestría|doctorado|especialidad|certif|credenci)/i.test(sample);
-    if (!hasNumbers && !hasCredentials) {
+    if (!hasCredibilityNumber && !hasCredentials) {
       add({
         tier: 2,
         text: 'No se detectaron cifras o credenciales específicas en el texto visible (años de experiencia, certificaciones, número de pacientes atendidos). Contenido con datos concretos tiende a ser mejor citado por herramientas de IA.',
