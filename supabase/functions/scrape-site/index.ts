@@ -424,7 +424,7 @@ Deno.serve(async (req) => {
           "Authorization": `Bearer ${FIRECRAWL_API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ url, formats: ["html", "markdown"] }),
+        body: JSON.stringify({ url, formats: ["rawHtml", "markdown"] }),
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -439,7 +439,7 @@ Deno.serve(async (req) => {
         return json({ error: `Firecrawl failed: ${fcData.error ?? "unknown error"}` }, 502);
       }
 
-      html = fcData.data?.html ?? "";
+      html = fcData.data?.rawHtml ?? "";
       markdown = fcData.data?.markdown ?? "";
     } catch (e) {
       clearTimeout(timer);
