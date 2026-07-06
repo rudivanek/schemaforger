@@ -1,16 +1,18 @@
 // supabase/functions/scrape-site/index.ts
-// Fetches a page and extracts business data for schema generation.
-// Deploy: supabase functions deploy scrape-site
+// Fetches a page via Firecrawl (handles JS-rendered pages) and extracts business data for schema generation.
 
 import { DOMParser } from "https://deno.land/x/deno_dom@v0.1.45/deno-dom-wasm.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+const FIRECRAWL_API_KEY = Deno.env.get("FIRECRAWL_API_KEY") ?? "";
+
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
   try {
     const { url } = await req.json();
@@ -18,45 +20,73 @@ Deno.serve(async (req) => {
       return json({ error: "Valid URL required" }, 400);
     }
 
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-      },
-      redirect: "follow",
-    });
-    if (!res.ok) return json({ error: `Fetch failed: ${res.status}` }, 502);
+    if (!FIRECRAWL_API_KEY) {
+      return json({ error: "FIRECRAWL_API_KEY not configured" }, 500);
+    }
 
-    const html = await res.text();
+    // 30s timeout — headless rendering is slower than a plain fetch
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+
+    let html: string;
+    let markdown: string;
+
+    try {
+      const fcRes = await fetch("https://api.firecrawl.dev/v1/scrape", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${FIRECRAWL_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ url, formats: ["html", "markdown"] }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!fcRes.ok) {
+        const body = await fcRes.text();
+        return json({ error: `Firecrawl error: ${fcRes.status} — ${body.slice(0, 200)}` }, 502);
+      }
+
+      const fcData = await fcRes.json();
+      if (!fcData.success) {
+        return json({ error: `Firecrawl failed: ${fcData.error ?? "unknown error"}` }, 502);
+      }
+
+      html = fcData.data?.html ?? "";
+      markdown = fcData.data?.markdown ?? "";
+    } catch (e) {
+      clearTimeout(timeout);
+      if ((e as Error).name === "AbortError") {
+        return json({ error: "Scrape timed out after 30s" }, 504);
+      }
+      throw e;
+    }
+
+    if (!html) return json({ error: "Firecrawl returned no HTML" }, 502);
+
     const doc = new DOMParser().parseFromString(html, "text/html");
     if (!doc) return json({ error: "Could not parse HTML" }, 500);
 
     const text = (sel: string) => doc.querySelector(sel)?.textContent?.trim() ?? null;
     const attr = (sel: string, a: string) => doc.querySelector(sel)?.getAttribute(a) ?? null;
 
-    // Existing JSON-LD on the page (important: don't duplicate what's there)
-    // We also read class attributes on each script tag for plugin detection.
+    // Existing JSON-LD — preserve class and id on each script tag for plugin fingerprinting
+    // (yoast-schema-graph, rank-math-schema class names; Firecrawl HTML includes JS-injected scripts)
     const existingJsonLd: unknown[] = [];
-    const jsonLdClasses: string[] = [];
+    const jsonLdSignals: string[] = [];
     doc.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
-      jsonLdClasses.push(s.getAttribute("class") ?? "");
+      const cls = s.getAttribute("class") ?? "";
+      const id = s.getAttribute("id") ?? "";
+      jsonLdSignals.push(`${cls} ${id}`);
       try { existingJsonLd.push(JSON.parse(s.textContent ?? "")); } catch { /* skip malformed */ }
     });
 
-    // --- SEO plugin detection ---
+    // SEO plugin detection
     const generatorMeta = attr('meta[name="generator"]', "content") ?? "";
-    const classSignal = jsonLdClasses.join(" ");
-    const hasYoastClass = /yoast-schema-graph/i.test(classSignal);
-    const hasRankMathClass = /rank-math-schema/i.test(classSignal);
+    const signalText = jsonLdSignals.join(" ");
+    const hasYoastClass = /yoast-schema-graph/i.test(signalText);
+    const hasRankMathClass = /rank-math-schema/i.test(signalText);
     const hasYoastPath = html.includes("/plugins/wordpress-seo/");
     const hasRankMathPath = html.includes("/plugins/seo-by-rank-math/");
     const hasYoastGenerator = /yoast/i.test(generatorMeta);
@@ -101,9 +131,8 @@ Deno.serve(async (req) => {
       same_as: [...sameAs].slice(0, 10),
       existing_jsonld: existingJsonLd,
       schema_source,
-      // Trimmed visible text so Claude can extract services/ratings with judgment,
-      // and so the mismatch check compares against what's actually on the page
-      visible_text_sample: bodyText.replace(/\s+/g, " ").slice(0, 6000),
+      // Firecrawl's markdown is cleaner than raw body text — use it as the visible sample
+      visible_text_sample: markdown.slice(0, 6000),
     };
 
     return json({ scraped });

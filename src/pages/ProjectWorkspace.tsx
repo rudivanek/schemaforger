@@ -552,6 +552,9 @@ export default function ProjectWorkspace() {
                 {scraping ? 'Escaneando...' : 'Escanear'}
               </button>
             </div>
+            <p className="text-[10px] font-mono text-ink-muted mt-1.5">
+              El escaneo puede tardar unos segundos — la página se renderiza por completo antes de extraer datos.
+            </p>
             {scrapeError && (
               <p className="text-xs font-mono text-orange mt-2 flex items-center gap-1">
                 <AlertCircle size={12} /> {scrapeError}
