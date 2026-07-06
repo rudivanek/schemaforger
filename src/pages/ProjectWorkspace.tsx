@@ -35,9 +35,15 @@ function stripJsonPlaceholders(obj: unknown): unknown {
   const result = walk(obj, '') as Record<string, unknown>;
 
   if (removed.length > 0) {
-    const note = removed.map(p => `Se removió un marcador del campo "${p}"`).join('\n');
-    const existing = typeof result._operator_notes === 'string' ? result._operator_notes : '';
-    result._operator_notes = existing ? `${existing}\n${note}` : note;
+    const newEntries = removed.map(p => `[FALTANTE] Se removió un marcador del campo "${p}"`);
+    const existing = result._operator_notes;
+    if (Array.isArray(existing)) {
+      result._operator_notes = [...existing, ...newEntries];
+    } else if (typeof existing === 'string' && existing.trim()) {
+      result._operator_notes = [existing.trim(), ...newEntries];
+    } else {
+      result._operator_notes = newEntries;
+    }
   }
 
   return result;
@@ -150,6 +156,12 @@ function extractMainEntityFromJsonLd(
   return { id, type: primaryType, name };
 }
 
+function normalizeOperatorNotes(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
+  if (typeof raw === 'string' && raw.trim()) return [raw.trim()];
+  return [];
+}
+
 // ── OpportunityPreview ────────────────────────────────────────────────────────
 
 function OpportunityPreview({ opp }: { opp: OpportunityResult }) {
@@ -240,7 +252,7 @@ export default function ProjectWorkspace() {
   const [generating, setGenerating] = useState(false);
   const [jsonld, setJsonld] = useState<Record<string, unknown> | null>(null);
   const [generateError, setGenerateError] = useState('');
-  const [operatorWarning, setOperatorWarning] = useState('');
+  const [operatorWarning, setOperatorWarning] = useState<string[]>([]);
   const [editedFields, setEditedFields] = useState<Record<string, Record<string, string>>>({});
   const [missingRequiredByType, setMissingRequiredByType] = useState<Record<string, string[]>>({});
   const [missingRecommendedByType, setMissingRecommendedByType] = useState<Record<string, string[]>>({});
@@ -291,7 +303,7 @@ export default function ProjectWorkspace() {
         if (proj.generated_jsonld) {
           const jld = stripJsonPlaceholders(proj.generated_jsonld) as Record<string, unknown>;
           setJsonld(jld);
-          if (jld._operator_notes) setOperatorWarning(String(jld._operator_notes));
+          if (jld._operator_notes) setOperatorWarning(normalizeOperatorNotes(jld._operator_notes));
           if (proj.status === 'draft') setStep(2);
           if (proj.status === 'validated' || proj.status === 'delivered') setStep(3);
           if (tmpl) initEditedFields(jld, tmpl);
@@ -442,7 +454,7 @@ export default function ProjectWorkspace() {
       if (!data?.jsonld) throw new Error('No se recibió JSON-LD del servidor');
       const jld = stripJsonPlaceholders(data.jsonld) as Record<string, unknown>;
       if (jld._operator_notes) {
-        setOperatorWarning(String(jld._operator_notes));
+        setOperatorWarning(normalizeOperatorNotes(jld._operator_notes));
       }
       setJsonld(jld);
       initEditedFields(jld, template ?? undefined);
@@ -959,10 +971,39 @@ export default function ProjectWorkspace() {
             </div>
           )}
 
-          {operatorWarning && (
+          {operatorWarning.length > 0 && (
             <div className="flex items-start gap-2 bg-amber-50 border border-amber-300 rounded p-3">
               <AlertTriangle size={14} className="text-amber-600 shrink-0 mt-0.5" />
-              <p className="text-xs font-mono text-amber-700">{operatorWarning}</p>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-mono font-semibold text-amber-800 mb-1.5">Notas del revisor</p>
+                <ul className="space-y-1">
+                  {operatorWarning.map((note, i) => {
+                    const labelMatch = note.match(/^\[([A-ZÁÉÍÓÚÑ]+)\]/);
+                    const label = labelMatch?.[1] ?? '';
+                    const isConflict = label === 'CONFLICTO';
+                    const isMissing = label === 'FALTANTE';
+                    const labelColor = isConflict
+                      ? 'text-red-700'
+                      : isMissing
+                      ? 'text-amber-800'
+                      : 'text-slate-600';
+                    const textColor = isConflict ? 'text-red-700' : 'text-amber-700';
+                    return (
+                      <li key={i} className="flex items-start gap-1.5 text-xs font-mono">
+                        <span className="shrink-0 text-amber-400 mt-0.5">·</span>
+                        <span className={textColor}>
+                          {labelMatch ? (
+                            <>
+                              <span className={`font-bold ${labelColor}`}>{labelMatch[0]}</span>
+                              {note.slice(labelMatch[0].length)}
+                            </>
+                          ) : note}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
             </div>
           )}
 

@@ -254,7 +254,7 @@ HARD RULES:
 4. Phone numbers in international format (+52 for Mexico) when the country is identifiable.
 5. openingHoursSpecification only if hours are explicitly stated in the source.
 6. If the page already contains JSON-LD (provided in input), do not duplicate its nodes — extend or correct instead, and note conflicts in a top-level "_operator_notes" string field.
-7. Output ONLY the JSON object. No markdown fences, no preamble, no explanation. The only allowed non-schema field is "_operator_notes" (a string with warnings for the human reviewer: missing required fields, mismatches with visible content, existing schema conflicts). The frontend strips this field before export.
+7. Output ONLY the JSON object. No markdown fences, no preamble, no explanation. The only allowed non-schema field is "_operator_notes" — an ARRAY of strings, one entry per distinct finding. Each entry MUST begin with a category label in square brackets: [CONFLICTO], [FALTANTE], [TELÉFONO], [DIRECCIÓN], [HORARIO], or [OTRO]. Example: ["[CONFLICTO] El schema existente de RankMath usa Organization para #organization. Este resultado lo reemplaza como MedicalBusiness — elimina el nodo Organization en RankMath.", "[FALTANTE] No se encontró valor numérico de calificación visible; se omitió AggregateRating."]. Never combine multiple findings into one string. The frontend strips this field before export.
 8. For enumerated fields (e.g. medicalSpecialty), if the accurate real-world value has no valid Schema.org enum match, do NOT substitute the closest formal enum value if it would misrepresent the specialty. Instead use a descriptive string literal and note the substitution in _operator_notes.${secondaryPageRule}`;
 }
 
@@ -302,9 +302,15 @@ function stripPlaceholders(obj: unknown): unknown {
   };
   const result = walk(obj, "") as Record<string, unknown>;
   if (removed.length > 0) {
-    const note = removed.map(p => `Se removió un marcador del campo "${p}"`).join("\n");
-    const existing = typeof result._operator_notes === "string" ? result._operator_notes : "";
-    result._operator_notes = existing ? `${existing}\n${note}` : note;
+    const newEntries = removed.map(p => `[FALTANTE] Se removió un marcador del campo "${p}"`);
+    const existing = result._operator_notes;
+    if (Array.isArray(existing)) {
+      result._operator_notes = [...existing, ...newEntries];
+    } else if (typeof existing === "string" && existing.trim()) {
+      result._operator_notes = [existing.trim(), ...newEntries];
+    } else {
+      result._operator_notes = newEntries;
+    }
   }
   return result;
 }
