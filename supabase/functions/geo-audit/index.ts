@@ -1,8 +1,6 @@
 // supabase/functions/geo-audit/index.ts
-// Checks whether AI crawlers can read the site (robots.txt) and whether llms.txt exists.
-// Optionally drafts an llms.txt from provided business data, and generates an improved
-// version of an existing llms.txt when checklist gaps are found.
-// Deploy: supabase functions deploy geo-audit
+// Checks robots.txt, llms.txt, and sitemap.xml health for AI-crawler visibility.
+// Also drafts or improves llms.txt using real business data from generated JSON-LD.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -22,7 +20,7 @@ const AI_CRAWLERS = [
   "cohere-ai",
 ];
 
-// Paths safe to disallow — admin/system, never real content
+// Paths that are safe to disallow — admin/system, not real content
 const NON_CONTENT_PATH = /^\/(wp-admin|wp-includes|wp-login|wp-json|cgi-bin|feed|feeds|trackback|admin|login|xmlrpc)(\/|$)|\.php(\/|\?|$)/i;
 
 Deno.serve(async (req) => {
@@ -40,7 +38,7 @@ Deno.serve(async (req) => {
       return json({ error: "site_url debe ser una URL completa válida, p. ej. https://ejemplo.com" }, 400);
     }
 
-    // ---- robots.txt check ----
+    // ---- robots.txt ----
     let robotsFound = false;
     let blockedCrawlers: string[] = [];
     let robotsRaw = "";
@@ -53,15 +51,17 @@ Deno.serve(async (req) => {
       }
     } catch { /* network failure */ }
 
-    // ---- llms.txt check ----
+    // ---- llms.txt ----
     let llmsFound = false;
     let llmsRaw: string | null = null;
     try {
       const l = await fetch(`${origin}/llms.txt`, { redirect: "follow" });
       if (l.ok) {
         const body = await l.text();
-        const looksLikeHtml = /<html|<!doctype/i.test(body.slice(0, 200));
-        if (!looksLikeHtml) { llmsFound = true; llmsRaw = body; }
+        if (!/<html|<!doctype/i.test(body.slice(0, 200))) {
+          llmsFound = true;
+          llmsRaw = body;
+        }
       }
     } catch { /* leave false */ }
 
@@ -69,25 +69,31 @@ Deno.serve(async (req) => {
     const business = business_data ? extractFromJsonLd(business_data) : { services: [] } as BusinessData;
     const pageUrlsList: string[] = Array.isArray(page_urls) ? page_urls : [];
 
-    // ---- draft llms.txt if missing ----
-    const generatedLlmsTxt =
-      !llmsFound ? draftLlmsTxt(origin, business, pageUrlsList) : null;
-
-    // ---- qualitative analysis ----
+    // ---- robots.txt checklist (needed before sitemap so we have sitemap_url) ----
     const robots_checklist = robotsFound ? analyzeRobotsTxt(robotsRaw) : null;
+
+    // ---- sitemap analysis (runs in parallel path but needs robots_checklist.sitemap_url) ----
+    const sitemap_check = await fetchAndAnalyzeSitemap(
+      origin,
+      robots_checklist?.sitemap_url ?? null,
+      pageUrlsList,
+    );
+
+    // ---- robots snippet — additive suggestion only, derived from sitemap_check ----
+    const suggested_robots_snippet = sitemap_check.found && !sitemap_check.referenced_in_robots
+      ? `Sitemap: ${sitemap_check.actual_sitemap_url}`
+      : null;
+
+    // ---- draft llms.txt if none exists ----
+    const generatedLlmsTxt = !llmsFound
+      ? draftLlmsTxt(origin, business, pageUrlsList)
+      : null;
+
+    // ---- llms.txt qualitative analysis ----
     const llmsContent = llmsRaw ?? generatedLlmsTxt ?? null;
     const llms_checklist = llmsContent ? analyzeLlmsTxt(llmsContent) : null;
 
-    // ---- sitemap probe → robots snippet (additive suggestion only) ----
-    let suggested_robots_snippet: string | null = null;
-    if (robotsFound && robots_checklist && !robots_checklist.has_sitemap) {
-      const sitemapUrl = await probeForSitemap(origin);
-      if (sitemapUrl) {
-        suggested_robots_snippet = `Sitemap: ${sitemapUrl}`;
-      }
-    }
-
-    // ---- improved llms.txt (existing file with gaps) ----
+    // ---- improved llms.txt for existing file with gaps ----
     let improved_llms_txt: string | null = null;
     if (llmsFound && llmsRaw && llms_checklist) {
       const hasGaps = !llms_checklist.has_business_info
@@ -109,6 +115,7 @@ Deno.serve(async (req) => {
       verdict: buildVerdict(robotsFound, blockedCrawlers, llmsFound),
       robots_checklist,
       llms_checklist,
+      sitemap_check,
       suggested_robots_snippet,
       improved_llms_txt,
     });
@@ -165,24 +172,138 @@ function extractFromJsonLd(jsonld: unknown): BusinessData {
   return result;
 }
 
-// ── Sitemap probe ─────────────────────────────────────────────────────────────
+// ── Sitemap analysis ──────────────────────────────────────────────────────────
 
-async function probeForSitemap(origin: string): Promise<string | null> {
-  const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
-  for (const url of candidates) {
-    try {
-      const r = await fetch(url, { redirect: "follow" });
-      if (!r.ok) continue;
-      const body = await r.text();
-      const looksLikeXml = body.trimStart().startsWith("<?xml") || /<urlset|<sitemapindex/i.test(body.slice(0, 500));
-      const looksLikeHtml = /<html|<!doctype/i.test(body.slice(0, 200));
-      if (looksLikeXml && !looksLikeHtml) return url;
-    } catch { /* try next */ }
-  }
-  return null;
+interface SitemapCheck {
+  found: boolean;
+  source: "sitemap_index" | "sitemap" | null;
+  actual_sitemap_url: string | null;
+  url_count: number;
+  referenced_in_robots: boolean;
+  robots_sitemap_mismatch: boolean;
+  known_pages_missing: string[];
 }
 
-// ── Crawler analysis ──────────────────────────────────────────────────────────
+function extractLocs(xml: string): string[] {
+  const locs: string[] = [];
+  const re = /<loc[^>]*>([^<]+)<\/loc>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    locs.push(m[1].trim());
+  }
+  return locs;
+}
+
+function normalizeUrlForCompare(url: string): string {
+  return url.toLowerCase().replace(/\/$/, "").trim();
+}
+
+async function isValidSitemapXml(url: string): Promise<boolean> {
+  try {
+    const r = await fetch(url, { redirect: "follow" });
+    if (!r.ok) return false;
+    const body = await r.text();
+    return (body.trimStart().startsWith("<?xml") || /<urlset|<sitemapindex/i.test(body.slice(0, 500)))
+      && !/<html|<!doctype/i.test(body.slice(0, 200));
+  } catch { return false; }
+}
+
+async function fetchAndAnalyzeSitemap(
+  origin: string,
+  robotsSitemapUrl: string | null,
+  pageUrls: string[],
+): Promise<SitemapCheck> {
+  const result: SitemapCheck = {
+    found: false,
+    source: null,
+    actual_sitemap_url: null,
+    url_count: 0,
+    referenced_in_robots: false,
+    robots_sitemap_mismatch: false,
+    known_pages_missing: [],
+  };
+
+  const candidates = [
+    { url: `${origin}/sitemap_index.xml`, source: "sitemap_index" as const },
+    { url: `${origin}/sitemap.xml`, source: "sitemap" as const },
+  ];
+
+  let rawXml: string | null = null;
+
+  for (const candidate of candidates) {
+    try {
+      const r = await fetch(candidate.url, { redirect: "follow" });
+      if (!r.ok) continue;
+      const body = await r.text();
+      const looksLikeXml = body.trimStart().startsWith("<?xml")
+        || /<urlset|<sitemapindex/i.test(body.slice(0, 500));
+      const looksLikeHtml = /<html|<!doctype/i.test(body.slice(0, 200));
+      if (looksLikeXml && !looksLikeHtml) {
+        rawXml = body;
+        result.actual_sitemap_url = candidate.url;
+        result.source = candidate.source;
+        break;
+      }
+    } catch { continue; }
+  }
+
+  if (!rawXml || !result.actual_sitemap_url) return result;
+  result.found = true;
+
+  // Collect URLs — follow index references
+  let allUrls: string[] = [];
+
+  if (/<sitemapindex/i.test(rawXml)) {
+    const subUrls = extractLocs(rawXml);
+    const limit = Math.min(subUrls.length, 10);
+    const subResults = await Promise.all(
+      subUrls.slice(0, limit).map(async (url) => {
+        try {
+          const r = await fetch(url, { redirect: "follow" });
+          if (!r.ok) return [];
+          const body = await r.text();
+          return extractLocs(body);
+        } catch { return []; }
+      }),
+    );
+    allUrls = subResults.flat();
+    // Extrapolate if capped
+    if (subUrls.length > limit) {
+      const avg = allUrls.length / limit;
+      result.url_count = Math.round(allUrls.length + avg * (subUrls.length - limit));
+    } else {
+      result.url_count = allUrls.length;
+    }
+  } else {
+    allUrls = extractLocs(rawXml);
+    result.url_count = allUrls.length;
+  }
+
+  // Cross-check robots.txt Sitemap: directive
+  if (robotsSitemapUrl) {
+    result.referenced_in_robots = true;
+    const normRobots = normalizeUrlForCompare(robotsSitemapUrl);
+    const normFound = normalizeUrlForCompare(result.actual_sitemap_url);
+    if (normRobots !== normFound) {
+      // Different URL in robots.txt — verify if it actually resolves to a valid sitemap
+      const robotsUrlValid = await isValidSitemapXml(robotsSitemapUrl);
+      result.robots_sitemap_mismatch = !robotsUrlValid;
+    }
+  }
+
+  // Cross-check known pages vs sitemap
+  const sitemapUrlSet = new Set(allUrls.map(normalizeUrlForCompare));
+  const originNorm = normalizeUrlForCompare(origin);
+  result.known_pages_missing = pageUrls.filter((pageUrl) => {
+    const norm = normalizeUrlForCompare(pageUrl);
+    if (norm === originNorm) return false; // skip homepage
+    return !sitemapUrlSet.has(norm);
+  });
+
+  return result;
+}
+
+// ── robots.txt analysis ───────────────────────────────────────────────────────
 
 function findBlockedAiCrawlers(robots: string): string[] {
   const blocked = new Set<string>();
@@ -192,9 +313,10 @@ function findBlockedAiCrawlers(robots: string): string[] {
 
   for (const line of lines) {
     if (line === "" || line.startsWith("#")) continue;
-    const [rawKey, ...rest] = line.split(":");
-    const key = rawKey.toLowerCase().trim();
-    const value = rest.join(":").trim();
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) continue;
+    const key = line.slice(0, colonIdx).toLowerCase().trim();
+    const value = line.slice(colonIdx + 1).trim();
 
     if (key === "user-agent") {
       if (!groupOpen) currentAgents = [];
@@ -214,7 +336,9 @@ function findBlockedAiCrawlers(robots: string): string[] {
       groupOpen = false;
     }
   }
-  const explicitAgents = [...robots.matchAll(/user-agent:\s*(.+)/gi)].map((m) => m[1].trim().toLowerCase());
+  const explicitAgents = [...robots.matchAll(/user-agent:\s*(.+)/gi)].map((m) =>
+    m[1].trim().toLowerCase()
+  );
   return [...blocked].filter((b) => {
     if (!b.endsWith("(via wildcard *)")) return true;
     const name = b.replace(" (via wildcard *)", "").toLowerCase();
@@ -273,8 +397,15 @@ function analyzeRobotsTxt(robots: string): RobotsChecklist {
     }
   }
 
-  return { has_sitemap, sitemap_url, unusual_disallows: unusual_disallows.slice(0, 10), high_crawl_delay };
+  return {
+    has_sitemap,
+    sitemap_url,
+    unusual_disallows: unusual_disallows.slice(0, 10),
+    high_crawl_delay,
+  };
 }
+
+// ── llms.txt analysis ─────────────────────────────────────────────────────────
 
 interface LlmsChecklist {
   has_business_info: boolean;
@@ -302,14 +433,21 @@ function analyzeLlmsTxt(text: string): LlmsChecklist {
     if (inPrioritySection && /\[.+?\]\(https?:\/\/.+?\)/.test(line)) priority_page_count++;
   }
 
-  const has_contact = /[\w.+%-]+@[\w-]+\.[a-z]{2,}|\+?\d[\d\s()./-]{7,}\d|contacto|contact/i.test(text);
+  const has_contact =
+    /[\w.+%-]+@[\w-]+\.[a-z]{2,}|\+?\d[\d\s()./-]{7,}\d|contacto|contact/i.test(text);
 
   let has_services = false;
   let inServicesSection = false;
   for (const line of lines) {
-    if (/^#{1,2}\s+(servicios|services)/i.test(line)) { inServicesSection = true; continue; }
+    if (/^#{1,2}\s+(servicios|services)/i.test(line)) {
+      inServicesSection = true;
+      continue;
+    }
     if (/^#{1,2}\s+/.test(line)) inServicesSection = false;
-    if (inServicesSection && /^[-*]\s+\S/.test(line)) { has_services = true; break; }
+    if (inServicesSection && /^[-*]\s+\S/.test(line)) {
+      has_services = true;
+      break;
+    }
   }
 
   return { has_business_info, priority_page_count, has_contact, has_services };
@@ -317,14 +455,12 @@ function analyzeLlmsTxt(text: string): LlmsChecklist {
 
 // ── llms.txt generators ───────────────────────────────────────────────────────
 
-// From-scratch draft (no llms.txt exists). Uses real data where available, bracketed
-// placeholders where the schema didn't supply the field.
+// From-scratch draft — uses real data where available, bracketed placeholders otherwise.
 function draftLlmsTxt(origin: string, business: BusinessData, pageUrls: string[]): string {
   const lines: string[] = [];
   lines.push(`# ${business.name ?? origin}`);
 
-  const desc = business.description
-    ?? "[Agrega aquí una descripción breve de tu negocio]";
+  const desc = business.description ?? "[Agrega aquí una descripción breve de tu negocio]";
   lines.push(`\n> ${desc}`);
 
   if (business.telephone || business.email || business.address) {
@@ -353,8 +489,7 @@ function draftLlmsTxt(origin: string, business: BusinessData, pageUrls: string[]
   return lines.join("\n") + "\n";
 }
 
-// Improved version of an existing llms.txt — starts from existing content, only appends
-// missing sections. Uses real data; falls back to bracketed placeholders.
+// Improved version of an existing llms.txt — starts from existing content, only appends.
 function buildImprovedLlmsTxt(
   existing: string,
   checklist: LlmsChecklist,
@@ -366,14 +501,11 @@ function buildImprovedLlmsTxt(
   if (!checklist.has_business_info) {
     const desc = business.description
       ?? "[Agrega aquí una descripción breve de tu negocio — no se encontró una en el schema generado]";
-    // Try to insert a blockquote right after the first top-level heading
     if (/^#\s+\S/m.test(content)) {
       content = content.replace(/^(#\s+.+)$/m, `$1\n\n> ${desc}`);
     } else {
-      // No heading found at all — prepend business info
       content = `> ${desc}\n\n` + content;
     }
-    // Collapse triple+ newlines introduced by the replacement
     content = content.replace(/\n{3,}/g, "\n\n");
   }
 
@@ -410,10 +542,18 @@ function buildImprovedLlmsTxt(
 
 function buildVerdict(robotsFound: boolean, blocked: string[], llmsFound: boolean): string {
   const parts: string[] = [];
-  if (!robotsFound) parts.push("No robots.txt found — AI crawlers can read the site by default, but there's no crawl control in place.");
-  else if (blocked.length) parts.push(`⚠ ${blocked.length} AI crawler(s) blocked: ${blocked.join(", ")}. The site may be invisible to those AI search tools.`);
-  else parts.push("✓ robots.txt present and no AI crawlers blocked.");
-  parts.push(llmsFound ? "✓ llms.txt already exists." : "No llms.txt — a draft can be generated (frame to clients as emerging best practice, not a guaranteed fix).");
+  if (!robotsFound) {
+    parts.push("No robots.txt found — AI crawlers can read the site by default, but there's no crawl control in place.");
+  } else if (blocked.length) {
+    parts.push(`⚠ ${blocked.length} AI crawler(s) blocked: ${blocked.join(", ")}. The site may be invisible to those AI search tools.`);
+  } else {
+    parts.push("✓ robots.txt present and no AI crawlers blocked.");
+  }
+  parts.push(
+    llmsFound
+      ? "✓ llms.txt already exists."
+      : "No llms.txt — a draft can be generated (frame to clients as emerging best practice, not a guaranteed fix).",
+  );
   return parts.join(" ");
 }
 

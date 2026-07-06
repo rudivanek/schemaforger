@@ -133,6 +133,7 @@ export interface Database {
           notes: string | null;
           robots_checklist: Json | null;
           llms_checklist: Json | null;
+          sitemap_check: Json | null;
           created_at: string;
         };
         Insert: {
@@ -145,6 +146,7 @@ export interface Database {
           notes?: string | null;
           robots_checklist?: Json | null;
           llms_checklist?: Json | null;
+          sitemap_check?: Json | null;
           created_at?: string;
         };
         Update: {
@@ -157,6 +159,7 @@ export interface Database {
           notes?: string | null;
           robots_checklist?: Json | null;
           llms_checklist?: Json | null;
+          sitemap_check?: Json | null;
           created_at?: string;
         };
       };

@@ -5,12 +5,22 @@ import type { Client, GeoAudit, SchemaProject, SchemaTemplate } from '../lib/dat
 import {
   ArrowLeft, Bot, FileText, Shield, ShieldOff, Copy, Check,
   AlertTriangle, CheckCircle, RefreshCw, Save, Zap, Lightbulb, Info, ArrowRight,
-  XCircle, ChevronDown, ChevronRight, Sparkles,
+  XCircle, ChevronDown, ChevronRight, Sparkles, Globe,
 } from 'lucide-react';
 
 const AI_CRAWLERS = ['GPTBot', 'ClaudeBot', 'PerplexityBot', 'Googlebot-Extended', 'CCBot', 'anthropic-ai', 'cohere-ai', 'FacebookBot'];
 
 // ── Types ────────────────────────────────────────────────────────────────────
+
+interface SitemapCheck {
+  found: boolean;
+  source: 'sitemap_index' | 'sitemap' | null;
+  actual_sitemap_url: string | null;
+  url_count: number;
+  referenced_in_robots: boolean;
+  robots_sitemap_mismatch: boolean;
+  known_pages_missing: string[];
+}
 
 interface RobotsChecklist {
   has_sitemap: boolean;
@@ -36,6 +46,7 @@ interface AuditResult {
   verdict: string;
   robots_checklist?: RobotsChecklist | null;
   llms_checklist?: LlmsChecklist | null;
+  sitemap_check?: SitemapCheck | null;
   suggested_robots_snippet?: string | null;
   improved_llms_txt?: string | null;
 }
@@ -61,6 +72,7 @@ interface Recommendation {
   linkTo?: string;
   linkLabel?: string;
   scrollToLlms?: boolean;
+  scrollToSitemap?: boolean;
 }
 
 // detector_id → Schema.org type that gets added to @graph when opportunity is included
@@ -200,21 +212,63 @@ function buildRecommendations(
     }
   }
 
-  // ── Tier 1 — robots.txt checklist ────────────────────────────────────
+  // ── Tier 1 — robots.txt checklist (unusual disallows + crawl-delay only) ──
   if (display?.robots_checklist) {
     const rc = display.robots_checklist;
-    if (!rc.has_sitemap) {
-      add({
-        tier: 1,
-        text: "Agrega una línea 'Sitemap: [url]' a tu robots.txt para ayudar a los crawlers a descubrir tu contenido de forma más eficiente.",
-      });
-    }
     if (rc.unusual_disallows.length > 0) {
       add({
         tier: 1,
         text: `Revisa las rutas bloqueadas en robots.txt: ${rc.unusual_disallows.join(', ')} — confirma que no estén ocultando contenido que quieres que las IA vean.`,
       });
     }
+  }
+
+  // ── Tier 1 — sitemap check ────────────────────────────────────────────
+  if (display?.sitemap_check) {
+    const sc = display.sitemap_check;
+    if (!sc.found) {
+      add({
+        tier: 1,
+        text: 'No se detectó sitemap.xml — agrega uno (los plugins Yoast/Rank Math lo generan automáticamente) para ayudar a los motores de búsqueda e IA a descubrir todo tu contenido.',
+        scrollToSitemap: true,
+      });
+    } else {
+      if (!sc.referenced_in_robots) {
+        add({
+          tier: 1,
+          text: `Tu sitemap existe pero robots.txt no lo menciona — agrega la línea 'Sitemap: ${sc.actual_sitemap_url ?? '[url]'}' para ayudar a los crawlers a encontrarlo más rápido.`,
+          scrollToSitemap: true,
+        });
+      }
+      if (sc.robots_sitemap_mismatch) {
+        add({
+          tier: 1,
+          text: 'La línea Sitemap en robots.txt no coincide con el sitemap real — verifica cuál URL es correcta.',
+          scrollToSitemap: true,
+        });
+      }
+      if (sc.known_pages_missing.length > 0 && sc.known_pages_missing.length <= 3) {
+        for (const url of sc.known_pages_missing) {
+          add({
+            tier: 1,
+            text: `La página '${urlPath(url)}' ya tiene schema generado pero no aparece en tu sitemap.xml — agrégala para mejorar su descubribilidad.`,
+            scrollToSitemap: true,
+          });
+        }
+      } else if (sc.known_pages_missing.length > 3) {
+        add({
+          tier: 1,
+          text: `${sc.known_pages_missing.length} páginas con schema generado no aparecen en tu sitemap.xml (${sc.known_pages_missing.slice(0, 2).map(urlPath).join(', ')} y más) — agrégralas para mejorar su descubribilidad.`,
+          scrollToSitemap: true,
+        });
+      }
+    }
+  } else if (display?.robots_checklist && !display.robots_checklist.has_sitemap) {
+    // Fallback for older saved audits that pre-date sitemap_check
+    add({
+      tier: 1,
+      text: "Agrega una línea 'Sitemap: [url]' a tu robots.txt para ayudar a los crawlers a descubrir tu contenido de forma más eficiente.",
+    });
   }
 
   // ── Tier 1 — llms.txt checklist ──────────────────────────────────────
@@ -402,6 +456,15 @@ function RecommendationsSection({
                       <ArrowRight size={10} />
                     </button>
                   )}
+                  {rec.scrollToSitemap && !rec.linkTo && (
+                    <button
+                      onClick={() => document.getElementById('sitemap-section')?.scrollIntoView({ behavior: 'smooth' })}
+                      className="inline-flex items-center gap-1 mt-1 text-[11px] font-mono text-blue hover:underline"
+                    >
+                      Ver sitemap abajo
+                      <ArrowRight size={10} />
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
@@ -558,6 +621,7 @@ export default function GeoAuditPage() {
       notes: result.verdict,
       robots_checklist: result.robots_checklist ?? null,
       llms_checklist: result.llms_checklist ?? null,
+      sitemap_check: result.sitemap_check ?? null,
     });
     setSaving(false);
     if (!error) {
@@ -595,6 +659,7 @@ export default function GeoAuditPage() {
     verdict: lastAudit.notes ?? '',
     robots_checklist: (lastAudit.robots_checklist as RobotsChecklist | null) ?? undefined,
     llms_checklist: (lastAudit.llms_checklist as LlmsChecklist | null) ?? undefined,
+    sitemap_check: (lastAudit.sitemap_check as SitemapCheck | null) ?? undefined,
   } as AuditResult : null);
 
   return (
@@ -766,6 +831,82 @@ export default function GeoAuditPage() {
               </div>
             )}
 
+          </div>
+
+          {/* sitemap.xml */}
+          <div id="sitemap-section" className="proof-card p-5">
+            <div className="flex items-center gap-2 mb-3">
+              <Globe size={15} className="text-ink-muted" />
+              <h2 className="section-title">sitemap.xml</h2>
+              {display.sitemap_check ? (
+                <span className={`chip ${display.sitemap_check.found ? 'chip-blue' : 'chip-orange'}`}>
+                  {display.sitemap_check.found ? 'Encontrado' : 'No encontrado'}
+                </span>
+              ) : (
+                <span className="chip chip-orange">Ejecuta auditoría</span>
+              )}
+            </div>
+
+            {display.sitemap_check ? (
+              display.sitemap_check.found ? (
+                <div className="space-y-3">
+                  <p className="text-xs font-mono text-ink">
+                    {display.sitemap_check.url_count.toLocaleString('es-MX')} URLs
+                    <span className="text-ink-muted ml-1.5">
+                      (vía {display.sitemap_check.source === 'sitemap_index' ? 'sitemap_index.xml' : 'sitemap.xml'})
+                    </span>
+                  </p>
+
+                  {!display.sitemap_check.referenced_in_robots && (
+                    <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded px-3 py-2.5">
+                      <AlertTriangle size={12} className="text-amber-500 shrink-0 mt-0.5" />
+                      <p className="text-[11px] font-mono text-amber-700">
+                        Tu sitemap existe pero robots.txt no lo menciona — agregar la línea{' '}
+                        <code className="bg-amber-100 px-1 rounded">
+                          Sitemap: {display.sitemap_check.actual_sitemap_url}
+                        </code>
+                        {' '}ayuda a los crawlers a encontrarlo más rápido.
+                      </p>
+                    </div>
+                  )}
+
+                  {display.sitemap_check.robots_sitemap_mismatch && (
+                    <div className="flex items-start gap-2 bg-orange/8 border border-orange/30 rounded px-3 py-2.5">
+                      <XCircle size={12} className="text-orange shrink-0 mt-0.5" />
+                      <p className="text-[11px] font-mono text-orange">
+                        La línea Sitemap en robots.txt no coincide con el sitemap real — verifica cuál URL es correcta.
+                      </p>
+                    </div>
+                  )}
+
+                  {display.sitemap_check.known_pages_missing.length > 0 && (
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle size={12} className="text-amber-500 shrink-0 mt-0.5" />
+                      <div className="min-w-0">
+                        <p className="text-[11px] font-mono text-amber-700 mb-1.5">
+                          Páginas con schema ya generado que no aparecen en el sitemap:
+                        </p>
+                        <div className="space-y-1">
+                          {display.sitemap_check.known_pages_missing.map(url => (
+                            <code key={url} className="block text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 break-all">
+                              {url}
+                            </code>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <p className="text-xs font-mono text-ink-muted">
+                  Sin sitemap.xml detectado — la mayoría de plugins SEO de WordPress (Yoast, Rank Math) lo generan automáticamente; verifica que esté habilitado.
+                </p>
+              )
+            ) : (
+              <p className="text-xs font-mono text-ink-muted">
+                Ejecuta una auditoría para analizar el sitemap.xml del sitio.
+              </p>
+            )}
           </div>
 
           {/* llms.txt */}

@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T20:00:00Z
+**Last Updated:** 2026-07-06T21:00:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -135,6 +135,32 @@ When `llms_txt_found` is true AND `llms_checklist` shows at least one false item
 ### 4g. Data flow change
 
 `handleAudit` in `GeoAuditPage` no longer makes a separate Supabase query for `generated_jsonld`. Instead it reads from the `projects` state already in memory, passing both the latest `generated_jsonld` and all `page_urls` in the edge function request body.
+
+### 4h. Sitemap.xml Analysis
+
+**DB:** `sitemap_check jsonb` column added to `geo_audits`.
+
+**Edge function** (`fetchAndAnalyzeSitemap`):
+1. Probes `{origin}/sitemap_index.xml` then `{origin}/sitemap.xml` (prefers index). Validates non-HTML XML response.
+2. For sitemap indexes: fetches up to 10 sub-sitemaps concurrently, counts URLs, extrapolates if more than 10.
+3. For regular sitemaps: counts `<loc>` entries directly.
+4. Cross-checks robots.txt `Sitemap:` URL: `referenced_in_robots = true` if present; `robots_sitemap_mismatch = true` if robots URL exists but doesn't resolve to valid XML (broken reference).
+5. Cross-checks known page_urls (from validated/delivered schema_projects) against sitemap URL set — flags any missing as `known_pages_missing`.
+
+Returns `SitemapCheck`: `{ found, source, actual_sitemap_url, url_count, referenced_in_robots, robots_sitemap_mismatch, known_pages_missing }`.
+
+`suggested_robots_snippet` is now derived from `sitemap_check` instead of a separate probe — non-null only when `found && !referenced_in_robots`.
+
+**GeoAuditPage card** (between robots.txt and llms.txt, `id="sitemap-section"`):
+- Found/not found badge
+- URL count + source label
+- Amber note if not referenced in robots (with inline code snippet of the line to add)
+- Red note if robots URL is broken/mismatched
+- Amber list of known pages missing from sitemap (most actionable finding)
+- "No sitemap detected" copy with WordPress plugin hint when not found
+- "Ejecuta auditoría" placeholder when no audit data yet
+
+**Recommendations** (`buildRecommendations`): sitemap section replaces the old robots `has_sitemap` rec. Old audits (no `sitemap_check`) fall back to the robots version. Sitemap recs include a "Ver sitemap abajo" scroll link. Missing-pages recs: ≤3 → one per page; >3 → grouped.
 
 ### 4d. Storage
 
