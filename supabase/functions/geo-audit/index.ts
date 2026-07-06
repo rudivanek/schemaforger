@@ -22,6 +22,9 @@ const AI_CRAWLERS = [
   "cohere-ai",
 ];
 
+// Paths that are safe to disallow — admin/system, not real content
+const NON_CONTENT_PATH = /^\/(wp-admin|wp-includes|wp-login|wp-json|cgi-bin|feed|feeds|trackback|admin|login|xmlrpc)(\/|$)|\.php(\/|\?|$)/i;
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -67,6 +70,11 @@ Deno.serve(async (req) => {
     const generatedLlmsTxt =
       !llmsFound && business_data ? draftLlmsTxt(origin, business_data) : null;
 
+    // ---- qualitative analysis ----
+    const robots_checklist = robotsFound ? analyzeRobotsTxt(robotsRaw) : null;
+    const llmsContent = llmsRaw ?? generatedLlmsTxt ?? null;
+    const llms_checklist = llmsContent ? analyzeLlmsTxt(llmsContent) : null;
+
     return json({
       robots_txt_found: robotsFound,
       robots_txt_raw: robotsRaw || null,
@@ -75,11 +83,15 @@ Deno.serve(async (req) => {
       llms_txt_raw: llmsRaw,
       generated_llms_txt: generatedLlmsTxt,
       verdict: buildVerdict(robotsFound, blockedCrawlers, llmsFound),
+      robots_checklist,
+      llms_checklist,
     });
   } catch (e) {
     return json({ error: String(e) }, 500);
   }
 });
+
+// ── Parsers ───────────────────────────────────────────────────────────────────
 
 // Parses robots.txt user-agent groups and reports AI crawlers hit by "Disallow: /"
 function findBlockedAiCrawlers(robots: string): string[] {
@@ -121,6 +133,125 @@ function findBlockedAiCrawlers(robots: string): string[] {
     return !explicitAgents.includes(name);
   });
 }
+
+interface RobotsChecklist {
+  has_sitemap: boolean;
+  sitemap_url: string | null;
+  unusual_disallows: string[];
+  high_crawl_delay: { agent: string; delay: number }[];
+}
+
+function analyzeRobotsTxt(robots: string): RobotsChecklist {
+  const lines = robots.split(/\r?\n/).map((l) => l.trim());
+  let has_sitemap = false;
+  let sitemap_url: string | null = null;
+  const unusual_disallows: string[] = [];
+  const high_crawl_delay: { agent: string; delay: number }[] = [];
+
+  let currentAgents: string[] = [];
+  let groupOpen = false;
+
+  for (const line of lines) {
+    if (!line || line.startsWith("#")) continue;
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) continue;
+    const key = line.slice(0, colonIdx).toLowerCase().trim();
+    const value = line.slice(colonIdx + 1).trim();
+
+    if (key === "sitemap") {
+      has_sitemap = true;
+      if (!sitemap_url) sitemap_url = value;
+      groupOpen = false;
+      continue;
+    }
+
+    if (key === "user-agent") {
+      if (!groupOpen) currentAgents = [];
+      currentAgents.push(value);
+      groupOpen = true;
+      continue;
+    }
+
+    if (key === "disallow") {
+      // Flag non-empty paths that aren't "/" (full block) and aren't admin/system
+      if (value && value !== "/" && !NON_CONTENT_PATH.test(value)) {
+        if (!unusual_disallows.includes(value)) unusual_disallows.push(value);
+      }
+      groupOpen = false;
+    } else if (key === "crawl-delay") {
+      const delay = parseFloat(value);
+      if (!isNaN(delay) && delay > 5) {
+        for (const agent of currentAgents) {
+          high_crawl_delay.push({ agent, delay });
+        }
+      }
+      groupOpen = false;
+    } else {
+      groupOpen = false;
+    }
+  }
+
+  return {
+    has_sitemap,
+    sitemap_url,
+    unusual_disallows: unusual_disallows.slice(0, 10),
+    high_crawl_delay,
+  };
+}
+
+interface LlmsChecklist {
+  has_business_info: boolean;
+  priority_page_count: number;
+  has_contact: boolean;
+  has_services: boolean;
+}
+
+function analyzeLlmsTxt(text: string): LlmsChecklist {
+  const lines = text.split("\n");
+
+  // Business info: top-level # heading + at least one blockquote (> ...) in first 10 lines
+  const first10 = lines.slice(0, 10);
+  const hasHeading = first10.some((l) => /^#\s+\S/.test(l));
+  const hasBlockquote = first10.some((l) => /^>\s+\S/.test(l));
+  const has_business_info = hasHeading && hasBlockquote;
+
+  // Priority pages: lines with markdown links under a "páginas / pages / priority" heading
+  // OR lines starting with "Priority:"
+  let priority_page_count = 0;
+  let inPrioritySection = false;
+  for (const line of lines) {
+    if (/^#{1,2}\s+(páginas|paginas|pages|principales|priority)/i.test(line)) {
+      inPrioritySection = true;
+      continue;
+    }
+    if (/^#{1,2}\s+/.test(line)) inPrioritySection = false;
+    if (/^priority:/i.test(line)) priority_page_count++;
+    if (inPrioritySection && /\[.+?\]\(https?:\/\/.+?\)/.test(line)) priority_page_count++;
+  }
+
+  // Contact: email, phone-like pattern, or literal "contacto"/"contact" keyword
+  const has_contact =
+    /[\w.+%-]+@[\w-]+\.[a-z]{2,}|\+?\d[\d\s()./-]{7,}\d|contacto|contact/i.test(text);
+
+  // Services: a heading with "servicios"/"services" followed by at least one list item
+  let has_services = false;
+  let inServicesSection = false;
+  for (const line of lines) {
+    if (/^#{1,2}\s+(servicios|services)/i.test(line)) {
+      inServicesSection = true;
+      continue;
+    }
+    if (/^#{1,2}\s+/.test(line)) inServicesSection = false;
+    if (inServicesSection && /^[-*]\s+\S/.test(line)) {
+      has_services = true;
+      break;
+    }
+  }
+
+  return { has_business_info, priority_page_count, has_contact, has_services };
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function draftLlmsTxt(origin: string, d: {
   name?: string; description?: string; services?: string[];

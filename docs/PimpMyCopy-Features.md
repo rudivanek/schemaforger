@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T00:00:00Z
+**Last Updated:** 2026-07-06T18:00:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -61,6 +61,49 @@ Audits a client site for AI-crawler visibility:
 - Plain-language **verdict** banner at top
 - "Guardar auditoría" persists result to `geo_audits`
 - Loads previous audit on page open if one exists
+
+### 4a. robots.txt Qualitative Checklist
+
+After the blocked-crawlers check, `geo-audit` now runs `analyzeRobotsTxt()` and returns a `robots_checklist` object:
+
+| Field | Type | Description |
+|---|---|---|
+| `has_sitemap` | boolean | Whether a `Sitemap:` directive is present |
+| `sitemap_url` | string \| null | The sitemap URL if found |
+| `unusual_disallows` | string[] | Disallow paths that are NOT admin/system (not matching `/wp-admin/`, `/cgi-bin/`, `.php`, etc.) — flagged for manual review |
+| `high_crawl_delay` | `{agent, delay}[]` | Any `Crawl-delay` > 5s per user-agent group |
+
+The UI shows a **"Cómo está ahora / Cómo debería estar"** checklist panel inside the robots.txt card:
+- ✓/✗ `Incluye directiva Sitemap` (shows URL if found)
+- Amber badge list of unusual Disallow paths (advisory, not auto-flagged as wrong)
+- Per-agent amber warning for high Crawl-delay values
+
+### 4b. llms.txt Content Checklist
+
+`geo-audit` runs `analyzeLlmsTxt()` on either `llms_txt_raw` (if file exists) or `generated_llms_txt` (draft) and returns `llms_checklist`:
+
+| Field | Type | Heuristic |
+|---|---|---|
+| `has_business_info` | boolean | Top-level `# Heading` AND a `> blockquote` in first 10 lines |
+| `priority_page_count` | number | Count of markdown links under a `## Páginas / pages / priority` heading, or lines starting `Priority:` |
+| `has_contact` | boolean | Email pattern, phone-like digit sequence, or "contacto"/"contact" keyword |
+| `has_services` | boolean | `## Servicios/Services` heading followed by at least one `- ` list item |
+
+The UI shows a **"Cómo está ahora / Cómo debería estar"** checklist panel inside the llms.txt card with four ✓/✗ rows.
+
+### 4c. New Tier 1 Recommendations (from checklists)
+
+`buildRecommendations()` now generates additional Tier 1 entries from the checklist data:
+
+- **Missing Sitemap directive** → "Agrega una línea 'Sitemap: [url]' a tu robots.txt…"
+- **Unusual Disallow paths** → "Revisa las rutas bloqueadas en robots.txt: [paths]…" (advisory tone)
+- **< 3 priority pages in llms.txt** → "Tu llms.txt tiene solo N página(s) prioritaria(s)…"
+- **No contact info in llms.txt** → "Agrega información de contacto (teléfono, email) a tu llms.txt…"
+- **No services section in llms.txt** → "Agrega una lista de tus servicios principales…"
+
+### 4d. Storage
+
+`robots_checklist` and `llms_checklist` are saved as JSONB columns on `geo_audits` when the operator clicks "Guardar auditoría". They are reloaded on page open alongside existing audit fields so the checklist panels remain visible between sessions.
 
 ---
 

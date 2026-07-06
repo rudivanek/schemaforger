@@ -131,6 +131,8 @@ export interface Database {
           llms_txt_found: boolean | null;
           generated_llms_txt: string | null;
           notes: string | null;
+          robots_checklist: Json | null;
+          llms_checklist: Json | null;
           created_at: string;
         };
         Insert: {
@@ -141,6 +143,8 @@ export interface Database {
           llms_txt_found?: boolean | null;
           generated_llms_txt?: string | null;
           notes?: string | null;
+          robots_checklist?: Json | null;
+          llms_checklist?: Json | null;
           created_at?: string;
         };
         Update: {
@@ -151,6 +155,8 @@ export interface Database {
           llms_txt_found?: boolean | null;
           generated_llms_txt?: string | null;
           notes?: string | null;
+          robots_checklist?: Json | null;
+          llms_checklist?: Json | null;
           created_at?: string;
         };
       };

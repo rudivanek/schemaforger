@@ -4,10 +4,27 @@ import { supabase } from '../lib/supabase';
 import type { Client, GeoAudit, SchemaProject, SchemaTemplate } from '../lib/database.types';
 import {
   ArrowLeft, Bot, FileText, Shield, ShieldOff, Copy, Check,
-  AlertTriangle, CheckCircle, RefreshCw, Save, Zap, Lightbulb, Info, ArrowRight
+  AlertTriangle, CheckCircle, RefreshCw, Save, Zap, Lightbulb, Info, ArrowRight,
+  XCircle,
 } from 'lucide-react';
 
 const AI_CRAWLERS = ['GPTBot', 'ClaudeBot', 'PerplexityBot', 'Googlebot-Extended', 'CCBot', 'anthropic-ai', 'cohere-ai', 'FacebookBot'];
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+interface RobotsChecklist {
+  has_sitemap: boolean;
+  sitemap_url: string | null;
+  unusual_disallows: string[];
+  high_crawl_delay: { agent: string; delay: number }[];
+}
+
+interface LlmsChecklist {
+  has_business_info: boolean;
+  priority_page_count: number;
+  has_contact: boolean;
+  has_services: boolean;
+}
 
 interface AuditResult {
   robots_txt_found: boolean;
@@ -17,6 +34,8 @@ interface AuditResult {
   llms_txt_raw: string;
   generated_llms_txt: string;
   verdict: string;
+  robots_checklist?: RobotsChecklist | null;
+  llms_checklist?: LlmsChecklist | null;
 }
 
 interface OpportunityResult {
@@ -51,6 +70,8 @@ const OPPORTUNITY_SCHEMA_TYPE: Record<string, string> = {
   howto: 'HowTo',
   jobposting: 'JobPosting',
 };
+
+// ── Utilities ────────────────────────────────────────────────────────────────
 
 function urlPath(url: string): string {
   try {
@@ -89,6 +110,8 @@ function collectTypesInJsonLd(jsonld: unknown): Set<string> {
   walk(jsonld);
   return types;
 }
+
+// ── Recommendations ──────────────────────────────────────────────────────────
 
 function buildRecommendations(
   projects: SchemaProject[],
@@ -175,19 +198,48 @@ function buildRecommendations(
     }
   }
 
-  // ── Tier 1 — llms.txt ────────────────────────────────────────────────
-  if (display?.llms_txt_found && display.llms_txt_raw) {
-    const nonHeaderLines = display.llms_txt_raw
-      .split('\n')
-      .filter(l => l.trim() && !l.trim().startsWith('#'));
-    if (display.llms_txt_raw.length < 200 || nonHeaderLines.length < 3) {
+  // ── Tier 1 — robots.txt checklist ────────────────────────────────────
+  if (display?.robots_checklist) {
+    const rc = display.robots_checklist;
+    if (!rc.has_sitemap) {
       add({
         tier: 1,
-        text: 'Tu llms.txt existe pero tiene poco contenido — agrega una lista de páginas clave, servicios y datos de contacto para ayudar a las herramientas de IA a entender tu negocio rápidamente.',
+        text: "Agrega una línea 'Sitemap: [url]' a tu robots.txt para ayudar a los crawlers a descubrir tu contenido de forma más eficiente.",
+      });
+    }
+    if (rc.unusual_disallows.length > 0) {
+      add({
+        tier: 1,
+        text: `Revisa las rutas bloqueadas en robots.txt: ${rc.unusual_disallows.join(', ')} — confirma que no estén ocultando contenido que quieres que las IA vean.`,
+      });
+    }
+  }
+
+  // ── Tier 1 — llms.txt checklist ──────────────────────────────────────
+  if (display?.llms_checklist && (display.llms_txt_found || display.generated_llms_txt)) {
+    const lc = display.llms_checklist;
+    if (lc.priority_page_count < 3) {
+      add({
+        tier: 1,
+        text: `Tu llms.txt tiene solo ${lc.priority_page_count} página${lc.priority_page_count !== 1 ? 's' : ''} prioritaria${lc.priority_page_count !== 1 ? 's' : ''} — agrega tus páginas de servicios y contacto más importantes (recomendado: mínimo 3).`,
         scrollToLlms: true,
       });
     }
-  } else if (!display?.llms_txt_found && display) {
+    if (!lc.has_contact) {
+      add({
+        tier: 1,
+        text: "Agrega información de contacto (teléfono, email) a tu llms.txt para que las herramientas de IA puedan responder preguntas de contacto directamente.",
+        scrollToLlms: true,
+      });
+    }
+    if (!lc.has_services) {
+      add({
+        tier: 1,
+        text: "Agrega una lista de tus servicios principales a tu llms.txt bajo un encabezado '## Servicios'.",
+        scrollToLlms: true,
+      });
+    }
+  } else if (display && !display.llms_txt_found) {
     if (display.generated_llms_txt) {
       add({
         tier: 1,
@@ -244,6 +296,22 @@ function buildRecommendations(
   }
 
   return recs;
+}
+
+// ── CheckItem helper ─────────────────────────────────────────────────────────
+
+function CheckItem({ ok, label, note }: { ok: boolean; label: string; note?: string }) {
+  return (
+    <div className="flex items-start gap-2">
+      {ok
+        ? <CheckCircle size={12} className="text-green shrink-0 mt-0.5" />
+        : <XCircle size={12} className="text-orange shrink-0 mt-0.5" />}
+      <div className="min-w-0">
+        <span className={`text-[11px] font-mono ${ok ? 'text-ink' : 'text-ink-muted'}`}>{label}</span>
+        {note && <span className="text-[11px] font-mono text-ink-muted ml-1">— {note}</span>}
+      </div>
+    </div>
+  );
 }
 
 // ── RecommendationsSection ────────────────────────────────────────────────────
@@ -488,6 +556,8 @@ export default function GeoAuditPage() {
       llms_txt_found: result.llms_txt_found,
       generated_llms_txt: llmsText,
       notes: result.verdict,
+      robots_checklist: result.robots_checklist ?? null,
+      llms_checklist: result.llms_checklist ?? null,
     });
     setSaving(false);
     if (!error) {
@@ -511,6 +581,8 @@ export default function GeoAuditPage() {
     llms_txt_raw: '',
     generated_llms_txt: lastAudit.generated_llms_txt ?? '',
     verdict: lastAudit.notes ?? '',
+    robots_checklist: (lastAudit.robots_checklist as RobotsChecklist | null) ?? undefined,
+    llms_checklist: (lastAudit.llms_checklist as LlmsChecklist | null) ?? undefined,
   } as AuditResult : null);
 
   return (
@@ -600,6 +672,47 @@ export default function GeoAuditPage() {
               </div>
             )}
 
+            {/* robots.txt checklist */}
+            {display.robots_checklist && (
+              <div className="mt-4 pt-4 border-t border-rule space-y-2">
+                <p className="text-[10px] font-mono text-ink-muted uppercase tracking-wider mb-2">
+                  Cómo está ahora / Cómo debería estar
+                </p>
+                <CheckItem
+                  ok={display.robots_checklist.has_sitemap}
+                  label="Incluye directiva Sitemap"
+                  note={display.robots_checklist.sitemap_url ?? undefined}
+                />
+                {display.robots_checklist.unusual_disallows.length > 0 && (
+                  <div className="mt-2">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle size={12} className="text-amber-500 shrink-0 mt-0.5" />
+                      <div className="min-w-0">
+                        <p className="text-[11px] font-mono text-amber-700">
+                          Rutas bloqueadas para revisar — confirma que no ocultan contenido indexable:
+                        </p>
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {display.robots_checklist.unusual_disallows.map(p => (
+                            <code key={p} className="text-[10px] font-mono bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 text-amber-800">
+                              {p}
+                            </code>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {display.robots_checklist.high_crawl_delay.map(({ agent, delay }) => (
+                  <div key={agent} className="flex items-start gap-2">
+                    <AlertTriangle size={12} className="text-amber-500 shrink-0 mt-0.5" />
+                    <p className="text-[11px] font-mono text-amber-700">
+                      Crawl-delay alto para {agent}: {delay}s — ralentiza (no bloquea) el rastreo de ese crawler.
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {display.robots_txt_raw && (
               <div className="mt-3">
                 <button
@@ -647,6 +760,38 @@ export default function GeoAuditPage() {
                   {llmsCopied ? 'Copiado' : 'Copiar llms.txt'}
                 </button>
               </div>
+            )}
+
+            {/* llms.txt checklist */}
+            {display.llms_checklist && (
+              <div className="mt-4 pt-4 border-t border-rule space-y-2">
+                <p className="text-[10px] font-mono text-ink-muted uppercase tracking-wider mb-2">
+                  Cómo está ahora / Cómo debería estar
+                </p>
+                <CheckItem
+                  ok={display.llms_checklist.has_business_info}
+                  label="Incluye nombre y descripción del negocio"
+                />
+                <CheckItem
+                  ok={display.llms_checklist.priority_page_count >= 3}
+                  label="Incluye al menos 3 páginas prioritarias"
+                  note={`${display.llms_checklist.priority_page_count} detectada${display.llms_checklist.priority_page_count !== 1 ? 's' : ''}`}
+                />
+                <CheckItem
+                  ok={display.llms_checklist.has_contact}
+                  label="Incluye información de contacto"
+                />
+                <CheckItem
+                  ok={display.llms_checklist.has_services}
+                  label="Incluye lista de servicios"
+                />
+              </div>
+            )}
+
+            {display.llms_txt_found && !display.llms_checklist && (
+              <p className="mt-3 text-[11px] font-mono text-ink-muted">
+                Ejecuta una nueva auditoría para ver el análisis detallado de este archivo.
+              </p>
             )}
           </div>
 
