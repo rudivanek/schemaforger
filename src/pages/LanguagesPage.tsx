@@ -201,37 +201,45 @@ function buildDebugMarkdown(
 
   lines.push('## Resultados de generación');
   lines.push('');
-  const generatedRows = rows.filter(r => r.checked && r.jsonld !== null);
-  for (const row of generatedRows) {
+  const attemptedRows = rows.filter(r => r.checked && (r.jsonld !== null || r.error !== null || r.generating));
+  for (const row of attemptedRows) {
     lines.push(`### ${row.lang} — ${row.url}`);
     lines.push('');
-    const errors = row.validationIssues.filter(i => i.severity === 'error');
-    const warnings = row.validationIssues.filter(i => i.severity === 'warning');
-    if (errors.length === 0 && warnings.length === 0) {
-      lines.push('**Validación:** Schema válido');
-    } else {
-      lines.push(`**Validación:** ${errors.length} error${errors.length !== 1 ? 'es' : ''}, ${warnings.length} advertencia${warnings.length !== 1 ? 's' : ''}`);
-    }
-    lines.push('');
-    if (errors.length > 0) {
-      lines.push('Errores:');
-      for (const e of errors) lines.push(`- ${e.node}: ${e.message}`);
+    if (row.error) {
+      lines.push(`**ERROR:** ${row.error}`);
+      lines.push('');
+    } else if (row.generating) {
+      lines.push('_(generando...)_');
+      lines.push('');
+    } else if (row.jsonld) {
+      const errors = row.validationIssues.filter(i => i.severity === 'error');
+      const warnings = row.validationIssues.filter(i => i.severity === 'warning');
+      if (errors.length === 0 && warnings.length === 0) {
+        lines.push('**Validación:** Schema válido');
+      } else {
+        lines.push(`**Validación:** ${errors.length} error${errors.length !== 1 ? 'es' : ''}, ${warnings.length} advertencia${warnings.length !== 1 ? 's' : ''}`);
+      }
+      lines.push('');
+      if (errors.length > 0) {
+        lines.push('Errores:');
+        for (const e of errors) lines.push(`- ${e.node}: ${e.message}`);
+        lines.push('');
+      }
+      if (warnings.length > 0) {
+        lines.push('Advertencias:');
+        for (const w of warnings) lines.push(`- ${w.node}: ${w.message}`);
+        lines.push('');
+      }
+      lines.push('```json');
+      lines.push(JSON.stringify(row.jsonld, null, 2));
+      lines.push('```');
       lines.push('');
     }
-    if (warnings.length > 0) {
-      lines.push('Advertencias:');
-      for (const w of warnings) lines.push(`- ${w.node}: ${w.message}`);
-      lines.push('');
-    }
-    lines.push('```json');
-    lines.push(JSON.stringify(row.jsonld, null, 2));
-    lines.push('```');
-    lines.push('');
   }
 
   lines.push('## URLs subidas (Paso 4)');
   lines.push('');
-  for (const row of generatedRows) {
+  for (const row of attemptedRows) {
     const uploaded = row.uploadedUrl.trim() || '— no subido aún —';
     lines.push(`**${row.lang}:** ${uploaded}`);
   }
@@ -743,7 +751,7 @@ export default function LanguagesPage() {
               <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">3</span>
               <h2 className="section-title text-ink">JSON-LD generado</h2>
             </div>
-            {generatedRows.length > 0 && (
+            {(phase === 'generating' || phase === 'generated') && checkedRows.length > 0 && (
               <div className="flex items-center gap-2 shrink-0">
                 {debugToast && (
                   <span className="text-[10px] font-mono text-green-700 flex items-center gap-1">
