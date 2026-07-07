@@ -1,7 +1,7 @@
 # PimpMyCopy — Features Documentation
 
 **Version:** 1.0.0
-**Last Updated:** 2026-07-06T23:00:00Z
+**Last Updated:** 2026-07-07T00:00:00Z
 **Project:** SchemaForge — JSON-LD + GEO Auditor (Sharpen.Studio)
 
 ---
@@ -372,3 +372,49 @@ Each scanned page produces one of three result cards:
 | `conflict` | Conflicto | Red | Live page has `@id` values that conflict with or are absent from projects |
 
 **Crear proyecto** quick-action button appears on `conflict` cards, pre-populating the new project's URL field and navigating to the workspace.
+
+---
+
+## 14. Multi-idioma / Weglot — LanguagesPage (`/client/:id/languages`)
+
+New client-level page for managing multilingual JSON-LD exports. Reached via the "Idiomas" button on the client detail page (alongside Consolidado, GEO, Nuevo proyecto).
+
+### 14a. Database
+
+Two new nullable columns added to `schema_projects`:
+- `language_code TEXT` — ISO 639-1 code (e.g. `en`, `es`) set by the operator or auto-filled from detection
+- `language_pair_id UUID REFERENCES schema_projects(id) ON DELETE SET NULL` — bidirectional link to the partner-language project
+
+### 14b. scrape-site edge function additions
+
+- `detected_language: string | null` — the `lang` attribute from `<html lang="...">`, lowercased, split on `-` to normalize (e.g. `en-US` → `en`)
+- `language_alternates: [{ lang: string; url: string }]` — all `<link rel="alternate" hreflang="XX" href="...">` tags from `<head>`, excluding `x-default`
+
+Both fields are stored in `raw_scraped_data` on save.
+
+### 14c. Section A — Grupos de idioma detectados
+
+Loads all projects for the client (all statuses). Uses a union-find algorithm to cluster projects whose `page_url` values match any entry in each other's `language_alternates`. Renders each cluster as a card:
+
+- **Project rows**: page URL (link to workspace), inline language-code dropdown (pre-filled from `detected_language` if `language_code` is null), status chip, optional "Guardar" button when the dropdown value changes.
+- **Ghost rows**: alternates whose URL has no matching project — shown with `{lang}: {url} — sin proyecto` and a "Crear proyecto" button that navigates to `/client/:id/project/new?url=...`.
+- **Footer**: "Vincular como par de idiomas" button (appears when the group has ≥2 real projects and isn't already linked) — saves `language_pair_id` reciprocally on both projects and saves `language_code` values at the same time.
+
+### 14d. Section B — Pares vinculados
+
+For each pair where `language_pair_id` is set bidirectionally, renders an export card:
+
+- Pair header: page URL slug, language codes, "Desvincular" button.
+- Per-language sub-cards (grid of 2): language badge, status chip, "Descargar JSON ({lang})" button (client-side download, `_`-prefixed keys stripped, filename `{slug}-{lang}-complete.json`), "URL del JSON subido ({lang})" text input for the WordPress media library URL.
+- Widget script block: generated when both JSON URLs are filled AND both projects are `validated` or `delivered`. Uses a two-variable JavaScript template with `URL_JSON_{LANG1}` / `URL_JSON_{LANG2}` variable names, `SCRIPT_ID = "schema-script-{slug}"`, Weglot `languageChanged` event listener. "Copiar" button with check state.
+- Instruction below script: "Pega este código en un widget HTML de Elementor en la página correspondiente."
+- Pairs where one or both projects are still `draft` show an "Ambos deben estar validados" advisory.
+
+### 14e. Section C — Sin versión de idioma detectada
+
+Lists projects that have no `language_alternates` and are not part of any linked pair. Purely informational — no action buttons.
+
+### 14f. ProjectWorkspace Step 1 addition
+
+After the scrape completes and `raw_scraped_data.language_alternates` is non-empty, a blue info card renders before the "Oportunidades detectadas" section: "Versiones de idioma detectadas: {list}" with each alternate's lang code and URL, and a "Ver en la página de Idiomas → " link pointing to `/client/:id/languages`. No duplication of the full pairing/export UI here.
+

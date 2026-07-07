@@ -6,6 +6,7 @@ import ClientDetailPage from './pages/ClientDetailPage';
 import ClientGraphPage from './pages/ClientGraphPage';
 import ProjectWorkspace from './pages/ProjectWorkspace';
 import GeoAuditPage from './pages/GeoAuditPage';
+import LanguagesPage from './pages/LanguagesPage';
 import TemplatesPage from './pages/TemplatesPage';
 import AppShell from './components/AppShell';
 
@@ -57,6 +58,14 @@ function AppRoutes() {
         element={
           <ProtectedRoute>
             <GeoAuditPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/client/:id/languages"
+        element={
+          <ProtectedRoute>
+            <LanguagesPage />
           </ProtectedRoute>
         }
       />

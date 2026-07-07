@@ -42,6 +42,8 @@ export interface Database {
           raw_scraped_data: Json | null;
           generated_jsonld: Json | null;
           status: 'draft' | 'validated' | 'delivered';
+          language_code: string | null;
+          language_pair_id: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -54,6 +56,8 @@ export interface Database {
           raw_scraped_data?: Json | null;
           generated_jsonld?: Json | null;
           status?: 'draft' | 'validated' | 'delivered';
+          language_code?: string | null;
+          language_pair_id?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -66,6 +70,8 @@ export interface Database {
           raw_scraped_data?: Json | null;
           generated_jsonld?: Json | null;
           status?: 'draft' | 'validated' | 'delivered';
+          language_code?: string | null;
+          language_pair_id?: string | null;
           created_at?: string;
           updated_at?: string;
         };

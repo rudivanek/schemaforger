@@ -78,6 +78,8 @@ interface ScrapedData {
   schema_source?: SchemaSource;
   conflict_types?: string[];
   opportunities?: OpportunityResult[];
+  detected_language?: string;
+  language_alternates?: Array<{ lang: string; url: string }>;
 }
 
 // Schema.org types that describe a business/organization entity.
@@ -846,6 +848,34 @@ export default function ProjectWorkspace() {
                   </div>
                 );
               })()}
+            </div>
+          )}
+
+          {/* ── Versiones de idioma detectadas ───────────────────────────── */}
+          {scraped && (scraped.language_alternates?.length ?? 0) > 0 && (
+            <div className="proof-card p-4">
+              <div className="flex items-start gap-2">
+                <Info size={13} className="text-blue shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-xs font-mono font-semibold text-ink mb-1.5">
+                    Versiones de idioma detectadas:
+                  </p>
+                  <ul className="space-y-0.5 mb-2">
+                    {scraped.language_alternates!.map(alt => (
+                      <li key={alt.url} className="text-[11px] font-mono text-ink-muted">
+                        <span className="text-ink font-medium">{alt.lang}</span>: {alt.url}
+                      </li>
+                    ))}
+                  </ul>
+                  <Link
+                    to={`/client/${clientId}/languages`}
+                    className="text-[11px] font-mono text-blue hover:underline inline-flex items-center gap-1"
+                  >
+                    Ver en la página de Idiomas
+                    <ArrowRight size={9} />
+                  </Link>
+                </div>
+              </div>
             </div>
           )}
 

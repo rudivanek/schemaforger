@@ -596,6 +596,19 @@ Deno.serve(async (req) => {
     // Run opportunity detectors
     const opportunities = runDetectors(html, doc, existingTypes);
 
+    // Detect page language from <html lang="...">
+    const detected_language: string | null = doc.querySelector("html")?.getAttribute("lang") ?? null;
+
+    // Detect hreflang alternate URLs from <link rel="alternate" hreflang="...">
+    const language_alternates: Array<{ lang: string; url: string }> = [];
+    doc.querySelectorAll('link[rel="alternate"]').forEach((link: Doc) => {
+      const lang = link.getAttribute("hreflang") ?? "";
+      const href = link.getAttribute("href") ?? "";
+      if (lang && href && lang !== "x-default") {
+        language_alternates.push({ lang: lang.toLowerCase(), url: href });
+      }
+    });
+
     const scraped = {
       page_url: url,
       title: text("title"),
@@ -612,6 +625,8 @@ Deno.serve(async (req) => {
       schema_source,
       visible_text_sample: markdown.slice(0, 6000),
       opportunities,
+      detected_language,
+      language_alternates,
     };
 
     return json({ scraped });

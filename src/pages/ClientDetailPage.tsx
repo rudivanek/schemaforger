@@ -345,6 +345,9 @@ export default function ClientDetailPage() {
               <Link to={`/client/${client.id}/geo`} className="btn-ghost text-xs py-1 px-2">
                 GEO
               </Link>
+              <Link to={`/client/${client.id}/languages`} className="btn-ghost text-xs py-1 px-2">
+                Idiomas
+              </Link>
               <button onClick={openModal} className="btn-primary flex items-center gap-1.5 text-xs py-1.5 px-3">
                 <Plus size={13} />
                 Nuevo proyecto
