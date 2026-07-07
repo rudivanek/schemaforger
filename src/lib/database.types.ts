@@ -169,6 +169,35 @@ export interface Database {
           created_at?: string;
         };
       };
+      language_exports: {
+        Row: {
+          id: string;
+          client_id: string;
+          source_url: string;
+          vertical: string | null;
+          languages: Json;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          client_id: string;
+          source_url: string;
+          vertical?: string | null;
+          languages?: Json;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          client_id?: string;
+          source_url?: string;
+          vertical?: string | null;
+          languages?: Json;
+          created_at?: string;
+          updated_at?: string;
+        };
+      };
     };
   };
 }
@@ -178,3 +207,4 @@ export type SchemaProject = Database['public']['Tables']['schema_projects']['Row
 export type SchemaTemplate = Database['public']['Tables']['schema_templates']['Row'];
 export type ValidationLog = Database['public']['Tables']['validation_log']['Row'];
 export type GeoAudit = Database['public']['Tables']['geo_audits']['Row'];
+export type LanguageExport = Database['public']['Tables']['language_exports']['Row'];

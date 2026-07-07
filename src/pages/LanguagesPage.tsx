@@ -1,22 +1,73 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import {
-  ArrowLeft, ArrowRight, Languages, Globe, Link2, Unlink,
-  Download, Copy, Check, Plus, Info,
+  ArrowLeft, ArrowRight, Languages, Scan, Sparkles, Download,
+  Copy, Check, Plus, Trash2, Info, AlertTriangle, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
-import type { Client, SchemaProject } from '../lib/database.types';
+import { validateJsonLd } from '../lib/validation';
+import type { ValidationIssue } from '../lib/validation';
+import type { Client, SchemaTemplate } from '../lib/database.types';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface OpportunityResult {
+  detector_id: string;
+  status: 'detected' | 'not_detected';
+  actionable: boolean;
+  extracted_data: unknown;
+}
+
+interface ScrapedData {
+  page_url?: string;
+  title?: string;
+  h1?: string;
+  og_site_name?: string;
+  visible_text_sample?: string;
+  detected_language?: string;
+  language_alternates?: Array<{ lang: string; url: string }>;
+  opportunities?: OpportunityResult[];
+  [key: string]: unknown;
+}
+
+interface LanguageRow {
+  id: string;
+  lang: string;
+  url: string;
+  isOriginal: boolean;
+  checked: boolean;
+  scrapedData: ScrapedData | null;
+  jsonld: unknown | null;
+  validationIssues: ValidationIssue[];
+  generating: boolean;
+  error: string | null;
+  uploadedUrl: string;
+  jsonExpanded: boolean;
+}
+
+type Phase = 'idle' | 'scanning' | 'selected' | 'generating' | 'generated';
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const VERTICALS = [
+  { value: 'medical',    label: 'Clínica / Consultorio Médico' },
+  { value: 'legal',      label: 'Despacho Legal / Abogados' },
+  { value: 'restaurant', label: 'Restaurante / Café' },
+  { value: 'realestate', label: 'Inmobiliaria' },
+  { value: 'local',      label: 'Negocio Local / Retail' },
+  { value: 'ecommerce',  label: 'Tienda en Línea' },
+  { value: 'services',   label: 'Servicios Profesionales' },
+];
+
+const COMMON_LANGS = [
+  'en', 'es', 'fr', 'de', 'pt', 'it', 'ja', 'zh', 'ar', 'nl', 'ko', 'ru',
+];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function urlPath(u: string): string {
   try { const { pathname, search } = new URL(u); return (pathname || '/') + search; }
   catch { return u; }
-}
-
-function normalizeUrl(u: string): string {
-  try { const x = new URL(u); return x.origin + x.pathname.replace(/\/$/, ''); }
-  catch { return u.replace(/\/$/, ''); }
 }
 
 function pageSlugFromUrl(u: string): string {
@@ -40,10 +91,9 @@ function stripInternalKeys(obj: unknown): unknown {
   return obj;
 }
 
-function downloadJson(project: SchemaProject, lang: string) {
-  if (!project.generated_jsonld) return;
-  const data = stripInternalKeys(project.generated_jsonld);
-  const slug = pageSlugFromUrl(project.page_url);
+function downloadJson(jsonld: unknown, lang: string, sourceUrl: string) {
+  const data = stripInternalKeys(jsonld);
+  const slug = pageSlugFromUrl(sourceUrl);
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -52,115 +102,22 @@ function downloadJson(project: SchemaProject, lang: string) {
   URL.revokeObjectURL(a.href);
 }
 
-function getLanguageAlternates(p: SchemaProject): Array<{ lang: string; url: string }> {
-  const s = p.raw_scraped_data as Record<string, unknown> | null;
-  if (!s?.language_alternates || !Array.isArray(s.language_alternates)) return [];
-  return s.language_alternates as Array<{ lang: string; url: string }>;
-}
-
-function getDetectedLanguage(p: SchemaProject): string | null {
-  const s = p.raw_scraped_data as Record<string, unknown> | null;
-  if (typeof s?.detected_language === 'string' && s.detected_language) {
-    return s.detected_language.split('-')[0].toLowerCase();
-  }
-  return null;
-}
-
-const COMMON_LANGS = ['en', 'es', 'fr', 'de', 'pt', 'it', 'ja', 'zh', 'ar', 'nl', 'ko', 'ru', 'pl', 'sv', 'da', 'tr'];
-
-const STATUS_CHIP: Record<string, string> = {
-  draft: 'chip-orange', validated: 'chip-blue', delivered: 'chip-green',
-};
-const STATUS_LABEL: Record<string, string> = {
-  draft: 'Borrador', validated: 'Validado', delivered: 'Entregado',
-};
-
-// ── Language group building ───────────────────────────────────────────────────
-
-interface LanguageGroup {
-  projectIds: string[];
-  ghosts: Array<{ lang: string; url: string }>;
-}
-
-function buildLanguageGroups(projects: SchemaProject[]): LanguageGroup[] {
-  const urlToId = new Map<string, string>();
-  for (const p of projects) urlToId.set(normalizeUrl(p.page_url), p.id);
-
-  const parent = new Map<string, string>(projects.map(p => [p.id, p.id]));
-  function find(id: string): string {
-    while (parent.get(id) !== id) {
-      const gp = parent.get(parent.get(id)!)!;
-      parent.set(id, gp);
-      id = gp;
-    }
-    return id;
-  }
-  function union(a: string, b: string) { parent.set(find(a), find(b)); }
-
-  // First pass: build unions
-  for (const p of projects) {
-    for (const alt of getLanguageAlternates(p)) {
-      const matchId = urlToId.get(normalizeUrl(alt.url));
-      if (matchId && matchId !== p.id) union(p.id, matchId);
-    }
-  }
-
-  // Collect which roots have any alternates (these form groups)
-  const rootsWithAlternates = new Set<string>();
-  for (const p of projects) {
-    if (getLanguageAlternates(p).length > 0) rootsWithAlternates.add(find(p.id));
-  }
-
-  // Second pass: collect ghosts (after union so roots are stable)
-  const ghostsByRoot = new Map<string, Array<{ lang: string; url: string }>>();
-  for (const p of projects) {
-    const alts = getLanguageAlternates(p);
-    if (alts.length === 0) continue;
-    const root = find(p.id);
-    for (const alt of alts) {
-      const matchId = urlToId.get(normalizeUrl(alt.url));
-      if (!matchId || matchId === p.id) {
-        const list = ghostsByRoot.get(root) ?? [];
-        if (!list.some(g => normalizeUrl(g.url) === normalizeUrl(alt.url))) {
-          list.push(alt);
-          ghostsByRoot.set(root, list);
-        }
-      }
-    }
-  }
-
-  // Build final groups: every project whose root has alternates belongs to a group
-  const groupMap = new Map<string, Set<string>>();
-  for (const p of projects) {
-    const root = find(p.id);
-    if (rootsWithAlternates.has(root)) {
-      if (!groupMap.has(root)) groupMap.set(root, new Set());
-      groupMap.get(root)!.add(p.id);
-    }
-  }
-
-  return [...groupMap.entries()].map(([root, ids]) => ({
-    projectIds: [...ids],
-    ghosts: ghostsByRoot.get(root) ?? [],
-  }));
-}
-
-// ── Widget script ─────────────────────────────────────────────────────────────
-
 function generateWidgetScript(
-  proj1: SchemaProject, lang1: string,
-  proj2: SchemaProject, lang2: string,
-  jsonUrl1: string, jsonUrl2: string,
+  rows: LanguageRow[],
+  sourceUrl: string,
 ): string {
-  const slug = pageSlugFromUrl(proj1.page_url);
-  const var1 = `URL_JSON_${lang1.toUpperCase()}`;
-  const var2 = `URL_JSON_${lang2.toUpperCase()}`;
+  const ready = rows.filter(r => r.checked && r.uploadedUrl.trim());
+  const slug = pageSlugFromUrl(sourceUrl);
+  const defaultLang = ready[0]?.lang ?? 'en';
+  const entries = ready
+    .map(r => `        ${r.lang}: "${r.uploadedUrl.trim()}"`)
+    .join(',\n');
+
   return `<script>
 document.addEventListener("DOMContentLoaded", function () {
-    const ${var1} =
-        "${jsonUrl1}";
-    const ${var2} =
-        "${jsonUrl2}";
+    const SCHEMA_URLS = {
+${entries}
+    };
     const SCRIPT_ID = "schema-script-${slug}";
     function injectSchema(data) {
         let script = document.getElementById(SCRIPT_ID);
@@ -173,17 +130,12 @@ document.addEventListener("DOMContentLoaded", function () {
         script.textContent = JSON.stringify(data);
     }
     function loadSchema(language) {
-        const url = language.toLowerCase().startsWith("${lang2.toLowerCase()}")
-            ? ${var2}
-            : ${var1};
-        fetch(url + "?v=" + Date.now(), {
-            cache: "no-store"
-        })
+        const lang = language.toLowerCase().slice(0, 2);
+        const url = SCHEMA_URLS[lang] || Object.values(SCHEMA_URLS)[0];
+        fetch(url + "?v=" + Date.now(), { cache: "no-store" })
             .then(function (response) {
                 if (!response.ok) {
-                    throw new Error(
-                        "Could not load JSON-LD: " + response.status
-                    );
+                    throw new Error("Could not load JSON-LD: " + response.status);
                 }
                 return response.json();
             })
@@ -192,17 +144,31 @@ document.addEventListener("DOMContentLoaded", function () {
                 console.error("Schema JSON-LD error:", error);
             });
     }
-    loadSchema(document.documentElement.lang || "${lang1.toLowerCase()}");
-    if (
-        window.Weglot &&
-        typeof Weglot.on === "function"
-    ) {
+    loadSchema(document.documentElement.lang || "${defaultLang}");
+    if (window.Weglot && typeof Weglot.on === "function") {
         Weglot.on("languageChanged", function (newLanguage) {
             loadSchema(newLanguage);
         });
     }
 });
 </script>`;
+}
+
+function newRow(lang: string, url: string, isOriginal: boolean, scraped: ScrapedData | null): LanguageRow {
+  return {
+    id: crypto.randomUUID(),
+    lang,
+    url,
+    isOriginal,
+    checked: true,
+    scrapedData: scraped,
+    jsonld: null,
+    validationIssues: [],
+    generating: false,
+    error: null,
+    uploadedUrl: '',
+    jsonExpanded: false,
+  };
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -212,110 +178,257 @@ export default function LanguagesPage() {
   const navigate = useNavigate();
 
   const [client, setClient] = useState<Client | null>(null);
-  const [projects, setProjects] = useState<SchemaProject[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [phase, setPhase] = useState<Phase>('idle');
 
-  const [langEdits, setLangEdits] = useState<Record<string, string>>({});
-  const [linking, setLinking] = useState<string | null>(null);
-  const [unlinking, setUnlinking] = useState<string | null>(null);
-  const [pairUrls, setPairUrls] = useState<Record<string, Record<string, string>>>({});
-  const [copied, setCopied] = useState<string | null>(null);
+  // Step 1
+  const [sourceUrl, setSourceUrl] = useState('');
 
-  const loadData = async () => {
+  // Step 2
+  const [rows, setRows] = useState<LanguageRow[]>([]);
+  const [vertical, setVertical] = useState('');
+  const [template, setTemplate] = useState<SchemaTemplate | null>(null);
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [customLang, setCustomLang] = useState('');
+  const [customUrl, setCustomUrl] = useState('');
+
+  // Widget copy
+  const [copied, setCopied] = useState(false);
+
+  const loadClient = async () => {
     if (!clientId) return;
-    setLoading(true);
-    const [{ data: c }, { data: p }] = await Promise.all([
-      supabase.from('clients').select('*').eq('id', clientId).maybeSingle(),
-      supabase.from('schema_projects').select('*').eq('client_id', clientId).order('created_at', { ascending: true }),
-    ]);
-    if (c) setClient(c);
-    setProjects(p ?? []);
-    setLoading(false);
-  };
-
-  useEffect(() => { loadData(); }, [clientId]);
-
-  const effectiveLang = (proj: SchemaProject): string => {
-    if (langEdits[proj.id] !== undefined) return langEdits[proj.id];
-    if (proj.language_code) return proj.language_code;
-    return getDetectedLanguage(proj) ?? '';
-  };
-
-  const handleSaveLangCode = async (projectId: string, code: string) => {
-    await supabase.from('schema_projects').update({ language_code: code || null }).eq('id', projectId);
-    setLangEdits(prev => { const n = { ...prev }; delete n[projectId]; return n; });
-    await loadData();
-  };
-
-  const handleLinkPair = async (group: LanguageGroup) => {
-    if (group.projectIds.length < 2) return;
-    const [idA, idB] = group.projectIds;
-    const projA = projects.find(p => p.id === idA)!;
-    const projB = projects.find(p => p.id === idB)!;
-    const langA = effectiveLang(projA);
-    const langB = effectiveLang(projB);
-    setLinking(group.projectIds.sort().join('-'));
-    await Promise.all([
-      supabase.from('schema_projects').update({
-        language_pair_id: idB,
-        ...(langA ? { language_code: langA } : {}),
-      }).eq('id', idA),
-      supabase.from('schema_projects').update({
-        language_pair_id: idA,
-        ...(langB ? { language_code: langB } : {}),
-      }).eq('id', idB),
-    ]);
-    setLinking(null);
-    await loadData();
-  };
-
-  const handleUnlinkPair = async (proj1: SchemaProject, proj2: SchemaProject) => {
-    setUnlinking([proj1.id, proj2.id].sort().join('-'));
-    await Promise.all([
-      supabase.from('schema_projects').update({ language_pair_id: null }).eq('id', proj1.id),
-      supabase.from('schema_projects').update({ language_pair_id: null }).eq('id', proj2.id),
-    ]);
-    setUnlinking(null);
-    await loadData();
-  };
-
-  const getPairUrl = (pairKey: string, projectId: string) =>
-    pairUrls[pairKey]?.[projectId] ?? '';
-
-  const setPairUrl = (pairKey: string, projectId: string, value: string) => {
-    setPairUrls(prev => ({
-      ...prev,
-      [pairKey]: { ...(prev[pairKey] ?? {}), [projectId]: value },
-    }));
-  };
-
-  const handleCopy = async (key: string, text: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(c => c === key ? null : c), 2000);
-  };
-
-  // ── Derived data ─────────────────────────────────────────────────────────────
-  const groups = buildLanguageGroups(projects);
-  const groupedProjectIds = new Set(groups.flatMap(g => g.projectIds));
-
-  const pairedIds = new Set<string>();
-  const pairs: Array<[SchemaProject, SchemaProject]> = [];
-  for (const p of projects) {
-    if (!p.language_pair_id || pairedIds.has(p.id)) continue;
-    const partner = projects.find(q => q.id === p.language_pair_id);
-    if (partner) {
-      pairs.push([p, partner]);
-      pairedIds.add(p.id);
-      pairedIds.add(partner.id);
+    const { data: c } = await supabase.from('clients').select('*').eq('id', clientId).maybeSingle();
+    if (c) {
+      setClient(c);
+      setSourceUrl(c.website_url);
+      setVertical(c.vertical);
     }
-  }
+    // Check for saved export
+    const { data: saved } = await supabase
+      .from('language_exports')
+      .select('*')
+      .eq('client_id', clientId)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-  const standaloneProjects = projects.filter(
-    p => !groupedProjectIds.has(p.id) && !pairedIds.has(p.id),
-  );
+    if (saved && Array.isArray(saved.languages) && saved.languages.length > 0) {
+      setSourceUrl(saved.source_url);
+      setVertical(saved.vertical ?? c?.vertical ?? '');
+      const restored = (saved.languages as Array<{
+        lang: string; url: string; generated_jsonld: unknown | null; uploaded_url: string | null; checked: boolean;
+      }>).map(l => {
+        const issues = l.generated_jsonld
+          ? validateJsonLd(l.generated_jsonld as { '@type'?: string | string[]; [key: string]: unknown })
+          : [];
+        return {
+          id: crypto.randomUUID(),
+          lang: l.lang,
+          url: l.url,
+          isOriginal: l.url === saved.source_url,
+          checked: l.checked ?? true,
+          scrapedData: null,
+          jsonld: l.generated_jsonld ?? null,
+          validationIssues: issues,
+          generating: false,
+          error: null,
+          uploadedUrl: l.uploaded_url ?? '',
+          jsonExpanded: false,
+        } satisfies LanguageRow;
+      });
+      setRows(restored);
+      setPhase('generated');
+    }
+  };
 
-  const projectById = new Map(projects.map(p => [p.id, p]));
+  useEffect(() => { loadClient(); }, [clientId]);
+
+  const loadTemplate = async (v: string) => {
+    if (!v) return;
+    setTemplateLoading(true);
+    const { data } = await supabase
+      .from('schema_templates')
+      .select('*')
+      .eq('vertical', v)
+      .limit(1)
+      .maybeSingle();
+    setTemplate(data ?? null);
+    setTemplateLoading(false);
+  };
+
+  useEffect(() => { if (vertical) loadTemplate(vertical); }, [vertical]);
+
+  const saveToDb = async (currentRows: LanguageRow[], currentSrc: string, currentVertical: string) => {
+    if (!clientId) return;
+    const languages = currentRows.map(r => ({
+      lang: r.lang,
+      url: r.url,
+      generated_jsonld: r.jsonld,
+      uploaded_url: r.uploadedUrl || null,
+      checked: r.checked,
+    }));
+    await supabase.from('language_exports').upsert(
+      {
+        client_id: clientId,
+        source_url: currentSrc,
+        vertical: currentVertical,
+        languages,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'client_id' },
+    );
+  };
+
+  // ── Step 1: Scan ────────────────────────────────────────────────────────────
+
+  const handleScan = async () => {
+    if (!sourceUrl.trim()) return;
+    setPhase('scanning');
+    setRows([]);
+    try {
+      const { data, error } = await supabase.functions.invoke('scrape-site', {
+        body: { url: sourceUrl.trim() },
+      });
+      if (error || data?.error) throw new Error(data?.error ?? error?.message ?? 'Scrape failed');
+      const scraped: ScrapedData = data.scraped;
+      const detectedLang = (scraped.detected_language ?? 'en').split('-')[0].toLowerCase();
+      const alts = (scraped.language_alternates ?? []) as Array<{ lang: string; url: string }>;
+
+      const initialRows: LanguageRow[] = [
+        newRow(detectedLang, sourceUrl.trim(), true, scraped),
+        ...alts.map(a => newRow(a.lang.split('-')[0].toLowerCase(), a.url, false, null)),
+      ];
+      setRows(initialRows);
+      setPhase('selected');
+    } catch (e) {
+      setPhase('idle');
+      alert(`Error al escanear: ${String(e)}`);
+    }
+  };
+
+  // ── Step 2: Add custom row ──────────────────────────────────────────────────
+
+  const handleAddCustomRow = () => {
+    if (!customLang || !customUrl.trim()) return;
+    setRows(prev => [...prev, newRow(customLang, customUrl.trim(), false, null)]);
+    setCustomLang('');
+    setCustomUrl('');
+  };
+
+  const toggleRowChecked = (id: string) => {
+    setRows(prev => prev.map(r => r.id === id ? { ...r, checked: !r.checked } : r));
+  };
+
+  const removeRow = (id: string) => {
+    setRows(prev => prev.filter(r => r.id !== id));
+  };
+
+  const updateRowField = <K extends keyof LanguageRow>(id: string, key: K, value: LanguageRow[K]) => {
+    setRows(prev => prev.map(r => r.id === id ? { ...r, [key]: value } : r));
+  };
+
+  // ── Step 3: Generate ────────────────────────────────────────────────────────
+
+  const handleGenerate = async () => {
+    if (!template) return;
+    setPhase('generating');
+
+    const checkedRows = rows.filter(r => r.checked);
+    const updatedRows = [...rows];
+
+    for (const row of checkedRows) {
+      const idx = updatedRows.findIndex(r => r.id === row.id);
+      updatedRows[idx] = { ...updatedRows[idx], generating: true, error: null };
+      setRows([...updatedRows]);
+
+      try {
+        // Scrape if not original (alternates haven't been scraped yet)
+        let scraped = row.scrapedData;
+        if (!scraped) {
+          const { data: sd, error: se } = await supabase.functions.invoke('scrape-site', {
+            body: { url: row.url },
+          });
+          if (se || sd?.error) throw new Error(sd?.error ?? se?.message ?? 'Scrape failed');
+          scraped = sd.scraped as ScrapedData;
+        }
+
+        // Generate schema
+        const { data: gd, error: ge } = await supabase.functions.invoke('generate-schema', {
+          body: {
+            scraped,
+            template: {
+              vertical: template.vertical,
+              schema_type_combo: template.schema_type_combo,
+              required_fields: template.required_fields,
+              recommended_fields: template.recommended_fields,
+              prompt_notes: template.prompt_notes,
+            },
+            included_opportunities: (scraped.opportunities ?? [])
+              .filter((o: OpportunityResult) => o.status === 'detected' && o.actionable),
+          },
+        });
+        if (ge || gd?.error) throw new Error(gd?.error ?? ge?.message ?? 'Generation failed');
+
+        const jsonld = gd.jsonld;
+        const issues = validateJsonLd(jsonld as { '@type'?: string | string[]; [key: string]: unknown });
+
+        updatedRows[idx] = {
+          ...updatedRows[idx],
+          generating: false,
+          scrapedData: scraped,
+          jsonld,
+          validationIssues: issues,
+          error: null,
+        };
+      } catch (e) {
+        updatedRows[idx] = {
+          ...updatedRows[idx],
+          generating: false,
+          error: String(e),
+        };
+      }
+      setRows([...updatedRows]);
+    }
+
+    setPhase('generated');
+    await saveToDb(updatedRows, sourceUrl, vertical);
+  };
+
+  // ── Upload URL change + auto-save ───────────────────────────────────────────
+
+  const handleUploadUrlChange = (id: string, value: string) => {
+    const next = rows.map(r => r.id === id ? { ...r, uploadedUrl: value } : r);
+    setRows(next);
+    // Debounced save omitted for simplicity — save happens when widget renders
+  };
+
+  const handleCopy = async (text: string) => {
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+    await saveToDb(rows, sourceUrl, vertical);
+  };
+
+  const handleReset = async () => {
+    if (!clientId) return;
+    await supabase.from('language_exports').delete().eq('client_id', clientId);
+    setRows([]);
+    setPhase('idle');
+    setSourceUrl(client?.website_url ?? '');
+    setVertical(client?.vertical ?? '');
+  };
+
+  // ── Derived ─────────────────────────────────────────────────────────────────
+
+  const checkedRows = rows.filter(r => r.checked);
+  const generatedRows = rows.filter(r => r.checked && r.jsonld !== null);
+  const allGenerated = checkedRows.length > 0 && generatedRows.length === checkedRows.length;
+  const allUrlsFilled = allGenerated && checkedRows.every(r => r.uploadedUrl.trim().length > 0);
+  const script = allUrlsFilled ? generateWidgetScript(checkedRows, sourceUrl) : null;
+
+  const showStep2 = phase === 'selected' || phase === 'generating' || phase === 'generated';
+  const showStep3 = phase === 'generating' || phase === 'generated';
+  const showStep4 = allGenerated;
+  const showStep5 = allUrlsFilled && !!script;
 
   return (
     <div className="max-w-4xl mx-auto space-y-5">
@@ -339,335 +452,346 @@ export default function LanguagesPage() {
           <div>
             <div className="flex items-center gap-2 mb-0.5">
               <Languages size={16} className="text-blue shrink-0" />
-              <h1 className="text-base font-semibold text-ink">Multi-idioma / Weglot</h1>
+              <h1 className="text-base font-semibold text-ink">JSON-LD multi-idioma</h1>
             </div>
             <p className="text-xs font-mono text-ink-muted">
-              Vincula versiones de idioma, descarga los JSON-LD y genera el widget Weglot
-              para <span className="text-ink">{client?.name ?? '...'}</span>.
+              Genera JSON-LD independiente por idioma y produce el widget Weglot. No requiere proyectos previos.
             </p>
           </div>
-          <button onClick={() => navigate(`/client/${clientId}`)} className="btn-ghost text-xs py-1 px-2 shrink-0">
-            Ver cliente
-          </button>
+          {phase !== 'idle' && (
+            <button
+              onClick={handleReset}
+              className="btn-ghost text-xs py-1 px-2 shrink-0 text-ink-muted"
+              title="Reiniciar y borrar sesión guardada"
+            >
+              Reiniciar
+            </button>
+          )}
         </div>
       </div>
 
-      {loading ? (
-        <div className="py-16 text-center text-xs font-mono text-ink-muted">Cargando proyectos...</div>
-      ) : (
-        <>
-          {/* ── Section A: Grupos de idioma detectados ─────────────────────── */}
-          <div className="proof-card p-5 space-y-4">
-            <div>
-              <h2 className="section-title text-ink mb-0.5">Grupos de idioma detectados</h2>
-              <p className="text-[11px] font-mono text-ink-muted">
-                Proyectos con etiquetas <code className="bg-proof px-1 rounded">hreflang</code> detectadas al escanear la página.
-              </p>
-            </div>
+      {/* ── Step 1: Escanear URL ── */}
+      <div className="proof-card p-5 space-y-3">
+        <div className="flex items-center gap-2">
+          <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">1</span>
+          <h2 className="section-title text-ink">Escanear página de inicio</h2>
+        </div>
+        <p className="text-[11px] font-mono text-ink-muted pl-7">
+          Ingresa la URL de la versión principal del sitio. El escáner detectará las versiones de idioma disponibles.
+        </p>
+        <div className="flex gap-2 pl-7">
+          <input
+            type="url"
+            value={sourceUrl}
+            onChange={e => setSourceUrl(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && phase === 'idle' && handleScan()}
+            className="input-field flex-1 font-mono text-sm"
+            placeholder="https://ejemplo.com"
+            disabled={phase !== 'idle'}
+          />
+          <button
+            onClick={handleScan}
+            disabled={phase !== 'idle' || !sourceUrl.trim()}
+            className="btn-primary flex items-center gap-1.5 text-xs shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Scan size={13} />
+            {phase === 'scanning' ? 'Escaneando...' : 'Escanear'}
+          </button>
+        </div>
+        {phase === 'scanning' && (
+          <p className="text-[11px] font-mono text-ink-muted pl-7 animate-pulse">
+            Analizando la página, detectando etiquetas hreflang...
+          </p>
+        )}
+      </div>
 
-            {groups.length === 0 ? (
-              <div className="py-6 text-center border border-dashed border-rule rounded">
-                <Globe size={20} className="text-ink-muted mx-auto mb-2" />
-                <p className="text-xs font-mono text-ink-muted">
-                  Ningún proyecto tiene etiquetas <code>hreflang</code> aún.
-                </p>
-                <p className="text-[11px] font-mono text-ink-muted mt-1">
-                  Escanea la página de inicio del cliente para detectarlas automáticamente.
-                </p>
+      {/* ── Step 2: Seleccionar idiomas ── */}
+      {showStep2 && (
+        <div className="proof-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">2</span>
+            <h2 className="section-title text-ink">Idiomas a generar</h2>
+          </div>
+          <p className="text-[11px] font-mono text-ink-muted pl-7">
+            Selecciona las versiones para las que se generará JSON-LD. Puedes desmarcar las que no necesites o agregar una URL manualmente.
+          </p>
+
+          {/* Language rows */}
+          <div className="pl-7 space-y-2">
+            {rows.map(row => (
+              <div key={row.id} className="flex items-center gap-3 py-2 px-3 border border-rule rounded bg-white">
+                <input
+                  type="checkbox"
+                  checked={row.checked}
+                  onChange={() => toggleRowChecked(row.id)}
+                  disabled={phase === 'generating' || phase === 'generated'}
+                  className="w-3.5 h-3.5 rounded border-rule accent-ink cursor-pointer shrink-0"
+                />
+                <span className="font-mono text-[11px] font-semibold text-ink uppercase w-8 shrink-0">
+                  {row.lang}
+                </span>
+                <span className="font-mono text-xs text-ink-muted flex-1 truncate">{row.url}</span>
+                {row.isOriginal && (
+                  <span className="text-[10px] font-mono text-ink-muted shrink-0">
+                    (escaneada)
+                  </span>
+                )}
+                {phase === 'idle' || phase === 'selected' ? (
+                  <button
+                    onClick={() => removeRow(row.id)}
+                    className="text-ink-muted hover:text-red transition-colors shrink-0"
+                    title="Eliminar fila"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                ) : null}
               </div>
-            ) : (
-              <div className="space-y-4">
-                {groups.map((group, gi) => {
-                  const groupProjects = group.projectIds
-                    .map(id => projectById.get(id))
-                    .filter(Boolean) as SchemaProject[];
-                  const alreadyLinked = groupProjects.length >= 2 &&
-                    groupProjects.every(p => p.language_pair_id !== null);
-                  const groupKey = group.projectIds.slice().sort().join('-');
-                  const hasTwoProjects = groupProjects.length >= 2;
+            ))}
 
-                  return (
-                    <div key={gi} className="border border-rule rounded overflow-hidden">
-                      <div className="divide-y divide-rule">
-                        {/* Project rows */}
-                        {groupProjects.map(proj => {
-                          const detectedLang = getDetectedLanguage(proj);
-                          const currentLang = effectiveLang(proj);
-                          const isDirty = langEdits[proj.id] !== undefined ||
-                            (currentLang !== '' && currentLang !== proj.language_code);
-                          return (
-                            <div key={proj.id} className="flex items-center gap-3 px-4 py-3 bg-white">
-                              <div className="flex-1 min-w-0">
-                                <Link
-                                  to={`/client/${clientId}/project/${proj.id}`}
-                                  className="font-mono text-sm text-ink hover:text-blue transition-colors"
-                                >
-                                  {urlPath(proj.page_url)}
-                                </Link>
-                                {detectedLang && !proj.language_code && (
-                                  <span className="ml-2 text-[10px] font-mono text-ink-muted">
-                                    detectado: {detectedLang}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="flex items-center gap-1.5 shrink-0">
-                                <select
-                                  value={currentLang}
-                                  onChange={e => setLangEdits(prev => ({ ...prev, [proj.id]: e.target.value }))}
-                                  className="input-field py-0.5 px-2 text-xs font-mono w-20"
-                                  title="Código de idioma"
-                                >
-                                  <option value="">--</option>
-                                  {COMMON_LANGS.map(l => (
-                                    <option key={l} value={l}>{l}</option>
-                                  ))}
-                                </select>
-                                {isDirty && (
-                                  <button
-                                    onClick={() => handleSaveLangCode(proj.id, currentLang)}
-                                    className="btn-ghost text-xs py-0.5 px-2"
-                                  >
-                                    Guardar
-                                  </button>
-                                )}
-                              </div>
-                              <span className={`chip ${STATUS_CHIP[proj.status] ?? 'chip-ink'} shrink-0`}>
-                                {STATUS_LABEL[proj.status] ?? proj.status}
-                              </span>
-                            </div>
-                          );
-                        })}
-
-                        {/* Ghost rows */}
-                        {group.ghosts.map(ghost => (
-                          <div key={ghost.url} className="flex items-center gap-3 px-4 py-3 bg-proof">
-                            <Info size={12} className="text-ink-muted shrink-0" />
-                            <div className="flex-1 min-w-0">
-                              <span className="font-mono text-xs text-ink-muted">
-                                <span className="font-semibold text-ink">{ghost.lang}</span>:{' '}
-                                <span className="truncate">{ghost.url}</span>
-                              </span>
-                              <span className="ml-2 text-[10px] font-mono text-ink-muted italic">sin proyecto</span>
-                            </div>
-                            <button
-                              onClick={() => navigate(`/client/${clientId}/project/new?url=${encodeURIComponent(ghost.url)}`)}
-                              className="btn-ghost text-xs py-1 px-2.5 flex items-center gap-1.5 shrink-0"
-                            >
-                              <Plus size={11} />
-                              Crear proyecto
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Footer */}
-                      <div className="px-4 py-2.5 bg-proof border-t border-rule flex items-center justify-between gap-3">
-                        <span className="text-[11px] font-mono text-ink-muted">
-                          {alreadyLinked ? (
-                            <span className="flex items-center gap-1.5 text-green-700">
-                              <Check size={11} className="text-green-600" />
-                              Par vinculado
-                            </span>
-                          ) : hasTwoProjects ? (
-                            'Listo para vincular'
-                          ) : (
-                            'Crea el proyecto para la URL marcada como "sin proyecto" para poder vincular.'
-                          )}
-                        </span>
-                        {hasTwoProjects && !alreadyLinked && (
-                          <button
-                            onClick={() => handleLinkPair(group)}
-                            disabled={linking === groupKey}
-                            className="btn-primary text-xs py-1 px-3 flex items-center gap-1.5 shrink-0"
-                          >
-                            <Link2 size={12} />
-                            {linking === groupKey ? 'Vinculando...' : 'Vincular como par de idiomas'}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
+            {/* Add custom row */}
+            {(phase === 'selected') && (
+              <div className="flex items-center gap-2 mt-2">
+                <select
+                  value={customLang}
+                  onChange={e => setCustomLang(e.target.value)}
+                  className="input-field py-1 px-2 text-xs font-mono w-20"
+                >
+                  <option value="">Lang</option>
+                  {COMMON_LANGS.map(l => <option key={l} value={l}>{l}</option>)}
+                </select>
+                <input
+                  type="url"
+                  value={customUrl}
+                  onChange={e => setCustomUrl(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleAddCustomRow()}
+                  placeholder="https://ejemplo.com/es/"
+                  className="input-field flex-1 font-mono text-xs py-1"
+                />
+                <button
+                  onClick={handleAddCustomRow}
+                  disabled={!customLang || !customUrl.trim()}
+                  className="btn-ghost text-xs py-1 px-2.5 flex items-center gap-1 disabled:opacity-40"
+                >
+                  <Plus size={11} />
+                  Agregar
+                </button>
               </div>
             )}
           </div>
 
-          {/* ── Section B: Pares vinculados ───────────────────────────────── */}
-          {pairs.length > 0 && (
-            <div className="proof-card p-5 space-y-5">
-              <div>
-                <h2 className="section-title text-ink mb-0.5">Pares vinculados — exportación</h2>
-                <p className="text-[11px] font-mono text-ink-muted">
-                  Descarga los JSON-LD, sube los archivos a WordPress, pega las URLs y genera el widget.
+          {/* Vertical selector */}
+          <div className="pl-7 space-y-1.5">
+            <label className="field-label">Vertical del negocio</label>
+            <select
+              value={vertical}
+              onChange={e => setVertical(e.target.value)}
+              disabled={phase === 'generating' || phase === 'generated'}
+              className="input-field w-full max-w-xs"
+            >
+              <option value="">Seleccionar vertical...</option>
+              {VERTICALS.map(v => (
+                <option key={v.value} value={v.value}>{v.label}</option>
+              ))}
+            </select>
+            {vertical && !template && !templateLoading && (
+              <p className="text-[10px] font-mono text-orange">
+                No se encontró plantilla para este vertical.
+              </p>
+            )}
+            {templateLoading && (
+              <p className="text-[10px] font-mono text-ink-muted">Cargando plantilla...</p>
+            )}
+            {template && (
+              <p className="text-[10px] font-mono text-ink-muted">
+                Plantilla: {template.label_es} · {template.schema_type_combo.join(' + ')}
+              </p>
+            )}
+          </div>
+
+          {/* Generate button */}
+          {phase === 'selected' && (
+            <div className="pl-7">
+              <button
+                onClick={handleGenerate}
+                disabled={checkedRows.length === 0 || !template}
+                className="btn-primary flex items-center gap-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Sparkles size={13} />
+                Generar JSON-LD para los seleccionados ({checkedRows.length})
+              </button>
+              {!template && vertical && (
+                <p className="text-[11px] font-mono text-orange mt-1.5">
+                  Selecciona un vertical con plantilla disponible para continuar.
                 </p>
-              </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
-              {pairs.map(([proj1, proj2]) => {
-                const lang1 = proj1.language_code ?? getDetectedLanguage(proj1) ?? 'en';
-                const lang2 = proj2.language_code ?? getDetectedLanguage(proj2) ?? 'es';
-                const pairKey = [proj1.id, proj2.id].sort().join('-');
-                const jsonUrl1 = getPairUrl(pairKey, proj1.id);
-                const jsonUrl2 = getPairUrl(pairKey, proj2.id);
-                const bothReady = jsonUrl1.trim() && jsonUrl2.trim();
-                const bothValidated =
-                  ['validated', 'delivered'].includes(proj1.status) &&
-                  ['validated', 'delivered'].includes(proj2.status);
-                const script = bothReady && bothValidated
-                  ? generateWidgetScript(proj1, lang1, proj2, lang2, jsonUrl1.trim(), jsonUrl2.trim())
-                  : null;
-                const pairUnlinkKey = [proj1.id, proj2.id].sort().join('-');
+      {/* ── Step 3: Resultados de generación ── */}
+      {showStep3 && (
+        <div className="proof-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">3</span>
+            <h2 className="section-title text-ink">JSON-LD generado</h2>
+          </div>
 
-                return (
-                  <div key={pairKey} className="border border-rule rounded overflow-hidden">
-                    {/* Pair header */}
-                    <div className="flex items-center justify-between gap-3 px-4 py-3 bg-proof border-b border-rule">
-                      <div className="flex items-center gap-2">
-                        <Globe size={13} className="text-blue shrink-0" />
-                        <span className="font-mono text-xs font-semibold text-ink">
-                          {urlPath(proj1.page_url)}
-                        </span>
-                        <span className="text-[10px] font-mono text-ink-muted">
-                          {lang1.toUpperCase()} ↔ {lang2.toUpperCase()}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {!bothValidated && (
-                          <span className="text-[10px] font-mono text-orange">
-                            Valida ambos proyectos para exportar
+          <div className="pl-7 space-y-3">
+            {checkedRows.map(row => (
+              <div key={row.id} className="border border-rule rounded overflow-hidden">
+                {/* Card header */}
+                <div className="flex items-center justify-between gap-3 px-4 py-3 bg-proof border-b border-rule">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs font-semibold text-ink uppercase">{row.lang}</span>
+                    <span className="text-[10px] font-mono text-ink-muted truncate max-w-xs">{urlPath(row.url)}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {row.generating && (
+                      <span className="text-[10px] font-mono text-ink-muted animate-pulse">
+                        {row.scrapedData ? 'Generando schema...' : 'Escaneando página...'}
+                      </span>
+                    )}
+                    {!row.generating && row.jsonld && (
+                      <>
+                        {/* Validation summary */}
+                        {row.validationIssues.length > 0 ? (
+                          <span className="flex items-center gap-1 text-[10px] font-mono text-orange">
+                            <AlertTriangle size={10} />
+                            {row.validationIssues.filter(i => i.severity === 'error').length} err,{' '}
+                            {row.validationIssues.filter(i => i.severity === 'warning').length} warn
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1 text-[10px] font-mono text-green-700">
+                            <Check size={10} />
+                            Sin errores
                           </span>
                         )}
                         <button
-                          onClick={() => handleUnlinkPair(proj1, proj2)}
-                          disabled={unlinking === pairUnlinkKey}
-                          className="btn-ghost text-xs py-1 px-2 flex items-center gap-1 text-ink-muted hover:text-red"
+                          onClick={() => downloadJson(row.jsonld, row.lang, sourceUrl)}
+                          className="btn-ghost text-xs py-1 px-2 flex items-center gap-1"
                         >
-                          <Unlink size={11} />
-                          {unlinking === pairUnlinkKey ? 'Desvinculando...' : 'Desvincular'}
+                          <Download size={11} />
+                          Descargar JSON
                         </button>
-                      </div>
-                    </div>
-
-                    <div className="p-4 space-y-4">
-                      {/* Per-language cards */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        {([{ proj: proj1, lang: lang1 }, { proj: proj2, lang: lang2 }] as Array<{ proj: SchemaProject; lang: string }>).map(({ proj, lang }) => (
-                          <div key={proj.id} className="border border-rule rounded p-3 space-y-3">
-                            <div className="flex items-center justify-between">
-                              <span className="font-mono text-xs font-semibold text-ink uppercase tracking-wide">
-                                {lang}
-                              </span>
-                              <span className={`chip ${STATUS_CHIP[proj.status] ?? 'chip-ink'}`}>
-                                {STATUS_LABEL[proj.status] ?? proj.status}
-                              </span>
-                            </div>
-                            <p className="text-[10px] font-mono text-ink-muted truncate">{urlPath(proj.page_url)}</p>
-                            <button
-                              onClick={() => downloadJson(proj, lang)}
-                              disabled={!proj.generated_jsonld}
-                              className="w-full btn-ghost text-xs flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
-                            >
-                              <Download size={12} />
-                              Descargar JSON ({lang})
-                            </button>
-                            <div>
-                              <label className="field-label text-[10px]">
-                                URL del JSON subido ({lang})
-                              </label>
-                              <input
-                                type="url"
-                                value={getPairUrl(pairKey, proj.id)}
-                                onChange={e => setPairUrl(pairKey, proj.id, e.target.value)}
-                                className="input-field w-full text-xs font-mono py-1"
-                                placeholder="https://ejemplo.com/wp-content/uploads/schema.json"
-                              />
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Widget script */}
-                      {script ? (
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between">
-                            <p className="text-[11px] font-mono font-semibold text-ink">
-                              Widget script generado
-                            </p>
-                            <button
-                              onClick={() => handleCopy(pairKey, script)}
-                              className="btn-ghost text-xs flex items-center gap-1.5 py-1 px-2"
-                            >
-                              {copied === pairKey
-                                ? <Check size={12} className="text-green-600" />
-                                : <Copy size={12} />}
-                              {copied === pairKey ? 'Copiado' : 'Copiar'}
-                            </button>
-                          </div>
-                          <pre className="bg-proof border border-rule rounded p-3 text-[10px] font-mono text-ink overflow-x-auto leading-relaxed max-h-72 overflow-y-auto whitespace-pre">
-                            {script}
-                          </pre>
-                          <p className="text-[10px] font-mono text-ink-muted">
-                            Pega este código en un widget HTML de Elementor en la página correspondiente.
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="flex items-start gap-2 bg-proof border border-rule rounded p-3">
-                          <Info size={12} className="text-ink-muted shrink-0 mt-0.5" />
-                          <p className="text-[11px] font-mono text-ink-muted">
-                            {!bothValidated
-                              ? 'Ambos proyectos deben estar validados o entregados para generar el widget.'
-                              : 'Ingresa las URLs de los JSON subidos para generar el widget.'}
-                          </p>
-                        </div>
-                      )}
-                    </div>
+                      </>
+                    )}
+                    {!row.generating && row.error && (
+                      <span className="text-[10px] font-mono text-red truncate max-w-xs" title={row.error}>
+                        Error — {row.error.slice(0, 60)}
+                      </span>
+                    )}
                   </div>
-                );
-              })}
-            </div>
-          )}
+                </div>
 
-          {/* ── Section C: Standalone projects ───────────────────────────── */}
-          {standaloneProjects.length > 0 && (
-            <div className="proof-card p-5 space-y-3">
-              <div>
-                <h2 className="section-title text-ink mb-0.5">Sin versión de idioma detectada</h2>
-                <p className="text-[11px] font-mono text-ink-muted">
-                  Estos proyectos no tienen etiquetas <code className="bg-proof px-1 rounded">hreflang</code> y no forman parte de ningún par vinculado.
-                </p>
-              </div>
-              <div className="border border-rule rounded overflow-hidden divide-y divide-rule">
-                {standaloneProjects.map(proj => (
-                  <div key={proj.id} className="flex items-center gap-3 px-4 py-2.5">
-                    <Link
-                      to={`/client/${clientId}/project/${proj.id}`}
-                      className="flex-1 font-mono text-xs text-ink hover:text-blue transition-colors truncate"
+                {/* JSON preview */}
+                {!row.generating && row.jsonld && (
+                  <div>
+                    <button
+                      onClick={() => updateRowField(row.id, 'jsonExpanded', !row.jsonExpanded)}
+                      className="w-full flex items-center justify-between px-4 py-2 text-[10px] font-mono text-ink-muted hover:bg-proof transition-colors"
                     >
-                      {urlPath(proj.page_url)}
-                    </Link>
-                    <span className={`chip ${STATUS_CHIP[proj.status] ?? 'chip-ink'} text-[10px] shrink-0`}>
-                      {STATUS_LABEL[proj.status] ?? proj.status}
-                    </span>
+                      <span>Vista previa JSON</span>
+                      {row.jsonExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                    </button>
+                    {row.jsonExpanded && (
+                      <pre className="px-4 pb-3 text-[10px] font-mono text-ink overflow-x-auto max-h-48 overflow-y-auto bg-white leading-relaxed">
+                        {JSON.stringify(stripInternalKeys(row.jsonld), null, 2).slice(0, 2000)}
+                        {JSON.stringify(stripInternalKeys(row.jsonld), null, 2).length > 2000 ? '\n... (truncado)' : ''}
+                      </pre>
+                    )}
                   </div>
-                ))}
-              </div>
-            </div>
-          )}
+                )}
 
-          {/* Empty state */}
-          {groups.length === 0 && pairs.length === 0 && projects.length === 0 && (
-            <div className="proof-card p-10 text-center">
-              <Languages size={24} className="text-ink-muted mx-auto mb-3" />
-              <p className="text-sm font-mono text-ink-muted">Este cliente no tiene proyectos aún.</p>
+                {/* Generating skeleton */}
+                {row.generating && (
+                  <div className="px-4 py-3">
+                    <div className="h-2 bg-rule rounded animate-pulse mb-1.5 w-3/4" />
+                    <div className="h-2 bg-rule rounded animate-pulse mb-1.5 w-1/2" />
+                    <div className="h-2 bg-rule rounded animate-pulse w-2/3" />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Step 4: Subir archivos y pegar URLs ── */}
+      {showStep4 && (
+        <div className="proof-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">4</span>
+            <h2 className="section-title text-ink">Subir a WordPress y pegar URLs</h2>
+          </div>
+          <p className="text-[11px] font-mono text-ink-muted pl-7">
+            Sube los archivos JSON a la biblioteca de medios de WordPress, luego pega las URLs resultantes abajo.
+          </p>
+
+          <div className="pl-7 space-y-3">
+            {checkedRows.filter(r => r.jsonld).map(row => (
+              <div key={row.id} className="flex items-center gap-3">
+                <span className="font-mono text-xs font-semibold text-ink uppercase w-8 shrink-0">
+                  {row.lang}
+                </span>
+                <input
+                  type="url"
+                  value={row.uploadedUrl}
+                  onChange={e => handleUploadUrlChange(row.id, e.target.value)}
+                  placeholder={`https://ejemplo.com/wp-content/uploads/${pageSlugFromUrl(sourceUrl)}-${row.lang}.json`}
+                  className="input-field flex-1 font-mono text-xs py-1.5"
+                />
+                {row.uploadedUrl.trim() && (
+                  <Check size={14} className="text-green-600 shrink-0" />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Step 5: Widget script ── */}
+      {showStep5 && script && (
+        <div className="proof-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <span className="w-5 h-5 rounded-full bg-green-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">5</span>
+            <h2 className="section-title text-ink">Widget Weglot generado</h2>
+          </div>
+
+          <div className="pl-7 space-y-3">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-mono text-ink-muted">
+                Script listo para {checkedRows.filter(r => r.uploadedUrl).length} idiomas.
+              </p>
               <button
-                onClick={() => navigate(`/client/${clientId}`)}
-                className="btn-primary text-xs mt-4 mx-auto flex items-center gap-1.5"
+                onClick={() => handleCopy(script)}
+                className="btn-ghost text-xs flex items-center gap-1.5 py-1 px-2"
               >
-                <ArrowRight size={12} />
-                Ir al cliente
+                {copied ? <Check size={12} className="text-green-600" /> : <Copy size={12} />}
+                {copied ? 'Copiado' : 'Copiar'}
               </button>
             </div>
-          )}
-        </>
+
+            <pre className="bg-proof border border-rule rounded p-3 text-[10px] font-mono text-ink overflow-x-auto leading-relaxed max-h-96 overflow-y-auto whitespace-pre">
+              {script}
+            </pre>
+
+            <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded p-3">
+              <Info size={12} className="text-blue shrink-0 mt-0.5" />
+              <p className="text-[11px] font-mono text-blue-700">
+                Pega este código en un widget HTML de Elementor en la página correspondiente.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Partial URL fill hint */}
+      {showStep4 && !showStep5 && allGenerated && (
+        <div className="flex items-center gap-2 px-5 py-3 bg-proof border border-rule rounded text-[11px] font-mono text-ink-muted">
+          <ArrowRight size={12} />
+          El widget se generará cuando ingreses todas las URLs de los JSON subidos.
+        </div>
       )}
     </div>
   );
