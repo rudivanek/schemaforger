@@ -7,7 +7,7 @@ import type { ValidationIssue } from '../lib/validation';
 import {
   ArrowLeft, ArrowRight, Scan, Sparkles, CheckCircle,
   Copy, Check, AlertTriangle, ExternalLink, ChevronDown, ChevronUp,
-  AlertCircle, Info
+  AlertCircle, Info, Bug
 } from 'lucide-react';
 
 type Step = 1 | 2 | 3;
@@ -226,6 +226,105 @@ function OpportunityPreview({ opp }: { opp: OpportunityResult }) {
   }
 }
 
+// ── Debug markdown export ─────────────────────────────────────────────────────
+
+function buildProjectDebugMarkdown(opts: {
+  client: Client | null;
+  project: SchemaProject | null;
+  pageUrl: string;
+  scraped: ScrapedData | null;
+  template: SchemaTemplate | null;
+  operatorWarning: string[];
+  missingRequiredByType: Record<string, string[]>;
+  missingRecommendedByType: Record<string, string[]>;
+  jsonld: Record<string, unknown> | null;
+  validationResult: ValidationIssue[] | null;
+}): string {
+  const {
+    client, project, pageUrl, scraped, template,
+    operatorWarning, missingRequiredByType, missingRecommendedByType,
+    jsonld, validationResult,
+  } = opts;
+
+  const lines: string[] = [];
+
+  lines.push('# SchemaForge — Debug Export (Proyecto)');
+  lines.push('');
+  lines.push(`**Cliente:** ${client?.name ?? '(desconocido)'}`);
+  lines.push(`**Proyecto:** ${project?.id ?? '(nuevo)'}`);
+  lines.push(`**Página:** ${pageUrl || '(sin URL)'}`);
+  lines.push(`**Vertical:** ${client?.vertical ?? template?.label_es ?? '(no seleccionado)'}`);
+  lines.push(`**Fecha:** ${new Date().toISOString()}`);
+  lines.push('');
+
+  lines.push('## Datos escaneados');
+  lines.push('');
+  if (scraped) {
+    lines.push('```json');
+    lines.push(JSON.stringify(scraped, null, 2));
+    lines.push('```');
+  } else {
+    lines.push('_(sin datos de escaneo)_');
+  }
+  lines.push('');
+
+  if (operatorWarning.length > 0) {
+    lines.push('## Notas del revisor');
+    lines.push('');
+    for (const note of operatorWarning) lines.push(`- ${note}`);
+    lines.push('');
+  }
+
+  const allMissingReq = Object.entries(missingRequiredByType).flatMap(([type, fields]) =>
+    fields.map(f => `[REQUERIDO] ${type}.${f}`)
+  );
+  const allMissingRec = Object.entries(missingRecommendedByType).flatMap(([type, fields]) =>
+    fields.map(f => `[RECOMENDADO] ${type}.${f}`)
+  );
+  if (allMissingReq.length > 0 || allMissingRec.length > 0) {
+    lines.push('## Campos faltantes');
+    lines.push('');
+    for (const f of allMissingReq) lines.push(`- ${f}`);
+    for (const f of allMissingRec) lines.push(`- ${f}`);
+    lines.push('');
+  }
+
+  lines.push('## JSON-LD generado');
+  lines.push('');
+  if (jsonld) {
+    lines.push('```json');
+    lines.push(JSON.stringify(jsonld, null, 2));
+    lines.push('```');
+  } else {
+    lines.push('_(aún no generado)_');
+  }
+  lines.push('');
+
+  lines.push('## Validación (si se ha ejecutado)');
+  lines.push('');
+  if (validationResult) {
+    const errors = validationResult.filter(i => i.severity === 'error');
+    const warnings = validationResult.filter(i => i.severity === 'warning');
+    if (errors.length === 0 && warnings.length === 0) {
+      lines.push('Schema válido — sin errores ni advertencias.');
+    } else {
+      if (errors.length > 0) {
+        lines.push(`**${errors.length} error${errors.length !== 1 ? 'es' : ''}:**`);
+        for (const e of errors) lines.push(`- [${e.node}] ${e.message}`);
+        lines.push('');
+      }
+      if (warnings.length > 0) {
+        lines.push(`**${warnings.length} advertencia${warnings.length !== 1 ? 's' : ''}:**`);
+        for (const w of warnings) lines.push(`- [${w.node}] ${w.message}`);
+      }
+    }
+  } else {
+    lines.push('_(validación no ejecutada en esta sesión)_');
+  }
+
+  return lines.join('\n');
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ProjectWorkspace() {
@@ -272,6 +371,7 @@ export default function ProjectWorkspace() {
   const [copyBlockedFields, setCopyBlockedFields] = useState<string[]>([]);
   const [wpExpanded, setWpExpanded] = useState(false);
   const [delivering, setDelivering] = useState(false);
+  const [debugToast, setDebugToast] = useState(false);
 
   const isNew = projectId === 'new';
 
@@ -580,6 +680,28 @@ export default function ProjectWorkspace() {
         setCopyBlockedFields((e as Error & { fields: string[] }).fields);
       }
     }
+  };
+
+  const handleCopyDebug = async () => {
+    const markdown = buildProjectDebugMarkdown({
+      client, project, pageUrl, scraped, template,
+      operatorWarning, missingRequiredByType, missingRecommendedByType,
+      jsonld, validationResult,
+    });
+    try {
+      await navigator.clipboard.writeText(markdown);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = markdown;
+      ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    setDebugToast(true);
+    setTimeout(() => setDebugToast(false), 2500);
   };
 
   const handleDeliver = async () => {
@@ -1012,7 +1134,7 @@ export default function ProjectWorkspace() {
         <div className="space-y-4">
           {template && (
             <div className="proof-card p-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div>
                   <span className="text-xs font-mono text-ink-muted">Tipo de schema: </span>
                   <span className="text-xs font-mono text-ink font-semibold">
@@ -1020,14 +1142,34 @@ export default function ProjectWorkspace() {
                   </span>
                   <span className="ml-2 chip chip-blue">{template.label_es}</span>
                 </div>
-                <button
-                  onClick={handleGenerate}
-                  disabled={generating}
-                  className="btn-orange flex items-center gap-2"
-                >
-                  <Sparkles size={14} />
-                  {generating ? 'Generando...' : 'Generar con IA'}
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  {scraped && (
+                    <div className="flex items-center gap-1.5">
+                      {debugToast && (
+                        <span className="text-[10px] font-mono text-green-700 flex items-center gap-1">
+                          <Check size={11} />
+                          Copiado al portapapeles
+                        </span>
+                      )}
+                      <button
+                        onClick={handleCopyDebug}
+                        className="btn-ghost text-xs py-1 px-2 flex items-center gap-1.5 text-ink-muted"
+                        title="Copiar sesión completa como Markdown para diagnóstico"
+                      >
+                        <Bug size={12} />
+                        Copiar debug
+                      </button>
+                    </div>
+                  )}
+                  <button
+                    onClick={handleGenerate}
+                    disabled={generating}
+                    className="btn-orange flex items-center gap-2"
+                  >
+                    <Sparkles size={14} />
+                    {generating ? 'Generando...' : 'Generar con IA'}
+                  </button>
+                </div>
               </div>
 
               {isSecondaryPage && mainEntity && (
