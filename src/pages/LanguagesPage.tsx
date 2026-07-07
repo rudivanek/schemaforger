@@ -267,6 +267,7 @@ export default function LanguagesPage() {
   const [vertical, setVertical] = useState('');
   const [template, setTemplate] = useState<SchemaTemplate | null>(null);
   const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateError, setTemplateError] = useState<string | null>(null);
   const [customLang, setCustomLang] = useState('');
   const [customUrl, setCustomUrl] = useState('');
 
@@ -333,6 +334,7 @@ export default function LanguagesPage() {
       .limit(1)
       .maybeSingle();
     setTemplate(data ?? null);
+    if (data) setTemplateError(null);
     setTemplateLoading(false);
   };
 
@@ -410,7 +412,11 @@ export default function LanguagesPage() {
   // ── Step 3: Generate ────────────────────────────────────────────────────────
 
   const handleGenerate = async () => {
-    if (!template) return;
+    if (!template) {
+      setTemplateError('Selecciona un vertical antes de generar — el template aún no se ha cargado.');
+      return;
+    }
+    setTemplateError(null);
     setPhase('generating');
 
     const checkedRows = rows.filter(r => r.checked);
@@ -713,16 +719,16 @@ export default function LanguagesPage() {
             <div className="pl-7">
               <button
                 onClick={handleGenerate}
-                disabled={checkedRows.length === 0 || !template}
+                disabled={checkedRows.length === 0 || templateLoading}
                 className="btn-primary flex items-center gap-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Sparkles size={13} />
-                Generar JSON-LD para los seleccionados ({checkedRows.length})
+                {templateLoading
+                  ? 'Cargando template...'
+                  : `Generar JSON-LD para los seleccionados (${checkedRows.length})`}
               </button>
-              {!template && vertical && (
-                <p className="text-[11px] font-mono text-orange mt-1.5">
-                  Selecciona un vertical con plantilla disponible para continuar.
-                </p>
+              {templateError && (
+                <p className="text-[11px] font-mono text-red mt-1.5">{templateError}</p>
               )}
             </div>
           )}
