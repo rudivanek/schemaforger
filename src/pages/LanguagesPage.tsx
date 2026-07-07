@@ -3,6 +3,7 @@ import { Link, useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, ArrowRight, Languages, Scan, Sparkles, Download,
   Copy, Check, Plus, Trash2, Info, AlertTriangle, ChevronDown, ChevronUp,
+  Bug,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { validateJsonLd } from '../lib/validation';
@@ -171,6 +172,84 @@ function newRow(lang: string, url: string, isOriginal: boolean, scraped: Scraped
   };
 }
 
+// ── Debug markdown export ─────────────────────────────────────────────────────
+
+function buildDebugMarkdown(
+  client: Client | null,
+  sourceUrl: string,
+  vertical: string,
+  rows: LanguageRow[],
+  script: string | null,
+): string {
+  const lines: string[] = [];
+
+  lines.push('# SchemaForge — Idiomas Debug Export');
+  lines.push('');
+  lines.push(`**Cliente:** ${client?.name ?? '(desconocido)'}`);
+  lines.push(`**URL fuente:** ${sourceUrl}`);
+  lines.push(`**Vertical:** ${vertical || '(no seleccionado)'}`);
+  lines.push(`**Fecha:** ${new Date().toISOString()}`);
+  lines.push('');
+
+  lines.push('## Idiomas detectados');
+  lines.push('');
+  for (const row of rows) {
+    const label = row.isOriginal ? '— URL original' : '— alternativa detectada';
+    lines.push(`- **${row.lang}**: ${row.url} ${label}`);
+  }
+  lines.push('');
+
+  lines.push('## Resultados de generación');
+  lines.push('');
+  const generatedRows = rows.filter(r => r.checked && r.jsonld !== null);
+  for (const row of generatedRows) {
+    lines.push(`### ${row.lang} — ${row.url}`);
+    lines.push('');
+    const errors = row.validationIssues.filter(i => i.severity === 'error');
+    const warnings = row.validationIssues.filter(i => i.severity === 'warning');
+    if (errors.length === 0 && warnings.length === 0) {
+      lines.push('**Validación:** Schema válido');
+    } else {
+      lines.push(`**Validación:** ${errors.length} error${errors.length !== 1 ? 'es' : ''}, ${warnings.length} advertencia${warnings.length !== 1 ? 's' : ''}`);
+    }
+    lines.push('');
+    if (errors.length > 0) {
+      lines.push('Errores:');
+      for (const e of errors) lines.push(`- ${e.node}: ${e.message}`);
+      lines.push('');
+    }
+    if (warnings.length > 0) {
+      lines.push('Advertencias:');
+      for (const w of warnings) lines.push(`- ${w.node}: ${w.message}`);
+      lines.push('');
+    }
+    lines.push('```json');
+    lines.push(JSON.stringify(row.jsonld, null, 2));
+    lines.push('```');
+    lines.push('');
+  }
+
+  lines.push('## URLs subidas (Paso 4)');
+  lines.push('');
+  for (const row of generatedRows) {
+    const uploaded = row.uploadedUrl.trim() || '— no subido aún —';
+    lines.push(`**${row.lang}:** ${uploaded}`);
+  }
+  lines.push('');
+
+  lines.push('## Script Weglot generado (Paso 5)');
+  lines.push('');
+  if (script) {
+    lines.push('```html');
+    lines.push(script);
+    lines.push('```');
+  } else {
+    lines.push('— aún no generado, faltan URLs —');
+  }
+
+  return lines.join('\n');
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function LanguagesPage() {
@@ -193,6 +272,8 @@ export default function LanguagesPage() {
 
   // Widget copy
   const [copied, setCopied] = useState(false);
+  // Debug export copy
+  const [debugToast, setDebugToast] = useState(false);
 
   const loadClient = async () => {
     if (!clientId) return;
@@ -406,6 +487,25 @@ export default function LanguagesPage() {
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
     await saveToDb(rows, sourceUrl, vertical);
+  };
+
+  const handleCopyDebug = async () => {
+    const markdown = buildDebugMarkdown(client, sourceUrl, vertical, rows, script);
+    try {
+      await navigator.clipboard.writeText(markdown);
+    } catch {
+      // Fallback: insert textarea, select all, execCommand copy
+      const ta = document.createElement('textarea');
+      ta.value = markdown;
+      ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    setDebugToast(true);
+    setTimeout(() => setDebugToast(false), 2500);
   };
 
   const handleReset = async () => {
@@ -632,9 +732,29 @@ export default function LanguagesPage() {
       {/* ── Step 3: Resultados de generación ── */}
       {showStep3 && (
         <div className="proof-card p-5 space-y-4">
-          <div className="flex items-center gap-2">
-            <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">3</span>
-            <h2 className="section-title text-ink">JSON-LD generado</h2>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="w-5 h-5 rounded-full bg-blue text-white text-[10px] font-bold flex items-center justify-center shrink-0">3</span>
+              <h2 className="section-title text-ink">JSON-LD generado</h2>
+            </div>
+            {generatedRows.length > 0 && (
+              <div className="flex items-center gap-2 shrink-0">
+                {debugToast && (
+                  <span className="text-[10px] font-mono text-green-700 flex items-center gap-1">
+                    <Check size={11} />
+                    Copiado al portapapeles
+                  </span>
+                )}
+                <button
+                  onClick={handleCopyDebug}
+                  className="btn-ghost text-xs py-1 px-2 flex items-center gap-1.5 text-ink-muted"
+                  title="Copiar sesión completa como Markdown para diagnóstico"
+                >
+                  <Bug size={12} />
+                  Copiar como Markdown (debug)
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="pl-7 space-y-3">
